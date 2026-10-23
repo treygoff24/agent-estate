@@ -1,0 +1,4 @@
+# agent-estate baseline: compressed RAM swap.
+ALGO=zstd
+PERCENT=25
+PRIORITY=100

@@ -1,0 +1,12 @@
+# Rendered by agent-estate (${label}) from estate.toml; do not edit here.
+# Change [modules.sync] in estate.toml, then: estate install sync
+[Unit]
+Description=agent-estate nightly sync, daily at ${modules.sync.hour}:${modules.sync.minute}
+
+[Timer]
+OnCalendar=*-*-* ${modules.sync.hour}:${modules.sync.minute}:00
+Persistent=true
+Unit=${label}.service
+
+[Install]
+WantedBy=timers.target

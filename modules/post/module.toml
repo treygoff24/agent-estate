@@ -1,0 +1,20 @@
+name = "post"
+description = "Agent-to-agent mail between sessions and machines (installs the post tool, its harness hooks, and optionally its cross-machine bridge)"
+platforms = ["mac", "linux"]
+requires = []
+
+[prerequisites]
+all = ["git"]
+
+# Every setting this module reads, with its default. Override any of them
+# in estate.toml under [modules.post]; an unlisted key is an error.
+[defaults]
+repo_url = "https://github.com/treygoff24/post"  # where the tool is cloned from
+checkout = ""          # the checkout; "" means <paths.code>/post (a leading ~ is fine)
+install_method = "auto" # auto = release binary, else build from the checkout; or release / source
+hooks = true           # install the mail hooks for each harness listed under [harnesses.*]
+register_sync = true   # add a row for the checkout to the sync repo table
+bridge = false         # true: relay mail between your machines through a private git repo
+relay_url = ""         # the relay repo's git URL; required when bridge = true
+ssh_key = "~/.ssh/post-relay"   # this machine's relay key (you provision it; see README)
+bridge_interval = ""   # "" = the bridge's default (15s on Linux, 60 on a Mac)

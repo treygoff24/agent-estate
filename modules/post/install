@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Install post: clone the tool, install the binary, run its first-run setup, wire the
+# hooks for each harness in estate.toml, optionally the bridge, and register the checkout
+# with the sync repo table. Idempotent; --dry-run changes nothing.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+msg="$(valid_settings)" || { say "$msg"; exit 1; }
+
+# 1. The tool's checkout.
+if [ ! -d "$CHECKOUT/.git" ]; then
+  [ ! -e "$CHECKOUT" ] || { say "$CHECKOUT exists but is not a git checkout; move it or set modules.post.checkout"; exit 1; }
+  run mkdir -p "$(dirname "$CHECKOUT")"
+  run git clone "$REPO_URL" "$CHECKOUT" || { say "cannot clone $REPO_URL (check git access)"; exit 1; }
+fi
+if [ "$ESTATE_DRY_RUN" = 1 ] && [ ! -d "$CHECKOUT/.git" ]; then
+  say "dry run: nothing after the clone can be previewed until $CHECKOUT exists"
+  exit 0
+fi
+HEAD_SHA="$(git -C "$CHECKOUT" rev-parse HEAD)"
+
+# 2. The binary: rebuilt only when the checkout moved or the binary is gone.
+want="$HEAD_SHA $METHOD"
+if [ -n "$(find_post)" ] && [ "$(cat "$STAMP" 2>/dev/null || true)" = "$want" ]; then
+  say "post is current ($(find_post))"
+else
+  release_url="${REPO_URL%.git}/releases/latest/download/post-installer.sh"
+  built=0
+  if [ "$METHOD" != source ] && command -v curl >/dev/null 2>&1 && [[ "$REPO_URL" == https://github.com/* ]]; then
+    if [ "$ESTATE_DRY_RUN" = 1 ]; then
+      say "would run: download $release_url and run it with --no-modify-path"
+      built=1
+    else
+      mkdir -p "$POST_STATE"
+      installer="$(mktemp "$POST_STATE/installer.XXXXXX")"
+      if curl -LsSf "$release_url" -o "$installer" && sh "$installer" --no-modify-path; then built=1; else say "release install did not work"; fi
+      rm -f -- "$installer"
+    fi
+  fi
+  if [ "$built" = 0 ]; then
+    [ "$METHOD" != release ] || { say "install_method = release failed; set install_method = source to build from the checkout"; exit 1; }
+    command -v cargo >/dev/null 2>&1 || { say "no release binary installed and cargo is not available: install Rust (https://rustup.rs) and re-run"; exit 1; }
+    run mkdir -p "$BIN" "$CARGO_ROOT"
+    run cargo install --locked --force --path "$CHECKOUT" --bin post --root "$CARGO_ROOT"
+    run ln -sfn "$CARGO_ROOT/bin/post" "$BIN/post"
+  fi
+  if [ "$ESTATE_DRY_RUN" != 1 ]; then
+    [ -n "$(find_post)" ] || { say "post is still not on PATH after installing (is $BIN on PATH?)"; exit 1; }
+    mkdir -p "$POST_STATE"
+    printf '%s\n' "$want" > "$STAMP"
+  fi
+fi
+
+# 3. First-run setup: creates the mail root and empty defaults; safe to repeat.
+if [ "$ESTATE_DRY_RUN" = 1 ]; then
+  say "would run: post doctor --fix --brief"
+else
+  post doctor --fix --brief || say "post doctor --fix reported findings; run: post doctor"
+fi
+
+# 4. Hooks, per harness. post's own installers merge into the harness config, keep
+# unrelated hooks and are idempotent. Run without a participant exported (they refuse it).
+if [ "$HOOKS" = true ]; then
+  if ! command -v node >/dev/null 2>&1; then
+    say "node is not installed, so the mail hooks are skipped (post itself works without them); install Node.js and re-run"
+  else
+    while IFS= read -r h; do
+      case "$h" in
+        claude) run env -u POST_PARTICIPANT node "$HOOK_DIR/install-claude-hooks.mjs" "$CLAUDE_SETTINGS" ;;
+        codex)  run env -u POST_PARTICIPANT node "$HOOK_DIR/install-codex-hooks.mjs" "$CODEX_HOOKS"
+                say "Codex asks you to approve the hook once: start codex, open /hooks, trust it" ;;
+        cursor) run env -u POST_PARTICIPANT node "$HOOK_DIR/install-cursor-hooks.mjs" "$CURSOR_HOOKS" ;;
+        grok)   run env -u POST_PARTICIPANT node "$HOOK_DIR/install-grok-hooks.mjs" "$GROK_HOOKS" ;;
+        pi)     run mkdir -p "$PI_EXT"
+                run cp "$HOOK_DIR/mail-hook-core.mjs" "$PI_EXT/mail-hook-core.mjs"
+                run cp "$HOOK_DIR/pi-mail.mjs" "$PI_EXT/index.js" ;;
+      esac
+    done < <(harnesses)
+  fi
+fi
+
+# 5. The cross-machine bridge (off by default).
+if [ "$BRIDGE" = true ]; then
+  [ -f "$SSH_KEY" ] || { say "relay key $SSH_KEY is missing: provision it first (modules/post/README.md, 'The bridge')"; exit 1; }
+  cfg_file="$POST_STATE/bridge-config.json"
+  if [ "$ESTATE_DRY_RUN" = 1 ]; then
+    say "would write: $cfg_file (host $ESTATE_MACHINE, relay $RELAY_URL)"
+  else
+    mkdir -p "$POST_STATE"
+    BRIDGE_HOST="$ESTATE_MACHINE" BRIDGE_RELAY="$RELAY_URL" python3 -c \
+      'import json, os; print(json.dumps({"host": os.environ["BRIDGE_HOST"], "relay_url": os.environ["BRIDGE_RELAY"], "channels": None}, indent=2))' > "$cfg_file"
+  fi
+  args=(--repo-url "$RELAY_URL" --host "$ESTATE_MACHINE" --ssh-key "$SSH_KEY" --config "$cfg_file" --post-bin "$(find_post)")
+  [ -z "$INTERVAL" ] || args+=(--interval "$INTERVAL")
+  (cd "$CHECKOUT" && run bridge/install.sh "${args[@]}")
+  hosts="$(cfg machines | python3 -c 'import json,sys; print(json.dumps({"v":1,"hosts":sorted(m["name"] for m in json.load(sys.stdin))}))')"
+  say "the relay's registry branch must list every machine: $hosts"
+fi
+
+# 6. Nightly update: a row in the sync repo table (the checkout is already cloned, so
+# sync only fast-forwards it and reinstalls when HEAD moves).
+if [ "$REGISTER" = true ]; then
+  row="$(printf 'post\t%s\t%s install post' "$CHECKOUT" "$ESTATE_ROOT/bin/estate")"
+  if [ -f "$REPOS_FILE" ] && awk -F'\t' '$1=="post"{f=1} END{exit !f}' "$REPOS_FILE"; then
+    say "sync row for post already present in $REPOS_FILE"
+  elif [ "$ESTATE_DRY_RUN" = 1 ]; then
+    say "would add the post row to $REPOS_FILE"
+  else
+    mkdir -p "$(dirname "$REPOS_FILE")"
+    printf '%s\n' "$row" >> "$REPOS_FILE"
+    say "added a post row to $REPOS_FILE (nightly update)"
+  fi
+fi
+say "installed"

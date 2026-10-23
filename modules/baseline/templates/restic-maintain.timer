@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly restic maintenance (agent-estate baseline)
+
+[Timer]
+OnCalendar=Sun *-*-* 04:30:00
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

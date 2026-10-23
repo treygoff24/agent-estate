@@ -1,0 +1,8 @@
+# Rendered by agent-estate (${label}) from estate.toml; do not edit here.
+[Unit]
+Description=estate cleanup: age-gated scratch sweep, census and orphan report
+
+[Service]
+Type=oneshot
+Environment=PATH=${paths.bin}:/usr/local/bin:/usr/bin:/bin
+ExecStart=${paths.bin}/estate-cleanup run

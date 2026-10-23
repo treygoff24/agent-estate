@@ -1,0 +1,18 @@
+# .globals/sets: the one always-on policy file.
+# Row: `name  token...`. Tokens: main, lane, !mac, !linux, only:<harness>, not:<harness>.
+# `lane` implies `main` and is written as both. Edit with `skillherd on|off`, or by hand;
+# `skillherd render` applies it.
+#
+# Keep this list SHORT. Every always-on skill puts its name and description in every
+# session's context, and bulk always-on lists degrade into noise: the list this was
+# modelled on grew from 20 to 80+ entries three times and had to be cut back each time.
+# Everything else stays dormant in the pool: find it with `skillherd search`, switch it on
+# for one project with `skillherd add <name>` (or `skillherd add @dev`), or globally with
+# `skillherd on <name>` when it has earned a place here.
+
+# build discipline
+task-design            main lane
+no-ceremony            main lane
+debugging-systematic   main
+tdd                    main
+grilling               main

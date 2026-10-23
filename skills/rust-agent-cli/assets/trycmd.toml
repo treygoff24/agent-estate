@@ -1,0 +1,7 @@
+bin.name = "tool"
+args = ["schema"]
+status.code = 0
+stdout = """
+{"ok":true,"data":{"schema_version":"1.0","target":"All"},"meta":{"schema_version":"1.0"}}
+"""
+stderr = ""

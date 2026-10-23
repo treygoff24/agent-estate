@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily restic backup (agent-estate baseline)
+
+[Timer]
+OnCalendar=*-*-* ${modules.baseline.backup_time}:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

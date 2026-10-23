@@ -1,0 +1,24 @@
+name = "baseline"
+description = "Safe VPS home for agents: agents' login, Tailscale, firewall with dead-man revert, security updates, optional restic backups"
+platforms = ["mac", "linux"]
+requires = []
+
+[prerequisites]
+linux = ["systemctl"]
+
+# Every setting this module reads, with its default. Override any of them
+# in estate.toml under [modules.baseline]; an unlisted key is an error.
+[defaults]
+agent_user = "agent"      # the separate non-sudo Linux login agents run as
+tailscale = true          # install Tailscale and admit its interface through the firewall
+public_ssh = false        # also accept SSH from the public internet (default: tailnet only)
+ssh_port = 22             # the port public SSH is opened on, when public_ssh is true
+zram = false              # compressed-RAM swap (zram-tools)
+toolchain = true          # root-setup also installs build-essential, nodejs and npm (the optional modules need them; the agents' login has no sudo)
+backups = false           # restic backups of the agents' home (Mac: only checks Time Machine)
+backup_repo = ""          # restic repository: s3:s3.amazonaws.com/bucket, b2:bucket:path, sftp:user@host:/path
+backup_paths = ""         # space-separated absolute paths, no spaces inside; "" means the agents' home
+backup_time = "03:15"     # daily backup, HH:MM, server local time
+keep_daily = 14           # retention: daily snapshots kept
+keep_weekly = 8           # retention: weekly snapshots kept
+keep_monthly = 12         # retention: monthly snapshots kept

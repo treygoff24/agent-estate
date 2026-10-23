@@ -1,0 +1,152 @@
+# estate.toml: the one file you fill in.
+#
+# Copy this to ~/.config/agent-estate/estate.toml on every machine (or point
+# ESTATE_CONFIG at it), edit the values, then run `estate config check`.
+# Keep the same file on every machine: it describes the whole estate, and
+# each machine finds itself in [[machines]].
+# No secrets go in here; keys live in the key file named under [keys].
+
+# Reverse-DNS prefix for launchd and systemd unit names. A module's label is
+# this prefix plus the module name, e.g. com.example.estate.tmp-cleanup.
+label_prefix = "com.example.estate"
+
+# Your tailnet's MagicDNS suffix, if you use Tailscale; "" if you do not.
+tailnet = ""
+
+[user]
+name = "Your Name"            # git author name
+email = "you@example.com"     # git author email
+
+[git]
+# Where your repos live. A repo named NAME is <remote_base>/NAME.git.
+# GitHub (private repos are fine): "git@github.com:<you>"
+# Self-hosted Forgejo or Gitea:    "git@git.example.com:<you>"
+remote_base = "git@github.com:<you>"
+
+[paths]
+# Every path may start with ~. These are the defaults; delete what you keep.
+code = "~/Code"                          # where repos are checked out
+skills = "~/.agents/skill-library"      # the shared skills pool (kept apart from ~/.agents/skills, which the skill tool renders into)
+state = "~/.local/state/agent-estate"    # logs, stamps, module state
+bin = "~/.local/bin"                     # where estate installs commands
+
+# One entry per machine. role: workstation (where you sit; it may run agents
+# too), agents (a box that runs agents, usually a rented VPS), or server
+# (hosts shared services such as a git forge). os: mac or linux.
+# ssh is the alias other machines use for it (default: its name).
+# hostname is optional: set it when the machine's hostname differs from its
+# name, so `estate doctor` can tell which entry is "this machine"
+# (or export ESTATE_MACHINE=<name>).
+[[machines]]
+name = "mac"
+ssh = "mac"
+role = "workstation"
+os = "mac"
+
+[[machines]]
+name = "vps"
+ssh = "vps"
+role = "agents"
+os = "linux"
+
+# One table per harness you use. accounts defaults to one account named
+# "default"; list more if you rotate several logins of the same harness.
+[harnesses.claude]
+
+[harnesses.codex]
+# accounts = ["main", "spare"]
+
+[keys]
+# The provider keys agents may use, by environment variable name. Values go
+# in the key file (mode 0600, your own file, never in git), one NAME=value per
+# line. The `keys` module scrubs these names from the environment and injects
+# them only into the tools you map under [modules.keys.tools] below.
+file = "~/.config/agent-estate/keys.env"
+names = []   # e.g. ["EXA_API_KEY", "FIRECRAWL_API_KEY"]
+
+[modules]
+# Modules estate installs and `estate doctor` checks on every machine; each
+# runs only on the platforms it supports (`show` is Linux-only, so on the Mac
+# it is skipped and reports ok). `estate list` shows them all. The same list
+# on every machine is the usual choice. INSTALL.md says what each one does.
+enabled = [
+  "baseline",      # VPS: agents' login with no sudo, Tailscale, firewall, updates. Mac: checks Tailscale
+  "sync",          # nightly: pull your repos through git, then run hooks
+  "config-sync",   # harness config (rules, hooks, settings) kept in one git repo
+  "keys",          # one 0600 key file, injected only into the tools you name
+  "usage",         # Claude and Codex rate-limit usage, polled into one snapshot
+  "guardrails",    # testrun, the shell-footgun hook, optional compile slots
+  "health",        # hourly read-only health report
+  "cleanup",       # age-gated sweep of old worktrees, build caches, logs
+  "tmp-cleanup",   # age out /tmp scratch (Linux)
+  "show",          # publish a file or dev port on your tailnet, with a time limit (Linux)
+  "post",          # agent-to-agent mail between sessions and machines (installs the post tool and its hooks)
+  "skills",        # one skills pool, seeded with a starter set and rendered into every harness (skill tool)
+]
+
+# Per-module settings: one [modules.<name>] table. Each module lists every
+# setting and its default under [defaults] in modules/<name>/module.toml; a
+# key it does not list is an error. Uncomment only what you want to change.
+
+# [modules.sync]
+# Recommended: uncomment the next line (and the [modules.sync] header above it).
+# It makes the nightly sync apply your agent-env repo after pulling, so a change
+# you push from one machine reaches every harness on every machine, and re-render
+# the skills pool (the skills module's check warns until "skillherd sync" is in the list).
+# hooks = ["estate-config-sync apply --pull", "skillherd sync"]
+# hour = 4              # local time the nightly job fires
+# minute = 0
+
+# [modules.config-sync]
+# Recommended: create an empty private repo for your agent configuration and name
+# it here, on every machine. Install then clones it (and fills it from the
+# starter if it is empty) instead of keeping the checkout local-only.
+# remote = "git@github.com:<you>/agent-env.git"
+
+# [modules.baseline]
+# agent_user = "agent"      # the separate non-sudo Linux login agents run as
+# tailscale = true          # false if you do not use Tailscale: also set public_ssh = true and remove "show" from enabled
+# public_ssh = false        # true also accepts SSH from the internet (default: tailnet only)
+# backups = false           # restic backups of the agents' home, from systemd user timers
+# backup_repo = ""          # required with backups = true, e.g. "s3:s3.amazonaws.com/<bucket>"
+#                           # (also put RESTIC_PASSWORD and the repo's access keys in the key file)
+
+# [modules.keys]
+# Which key each tool may see. Tools run through the shims in shim_dir, which
+# must come first on PATH in the environment each harness starts from.
+# optional = ["OPENROUTER_API_KEY"]    # names that may be absent
+# [modules.keys.tools]
+# exa-agent = ["EXA_API_KEY"]
+
+# [modules.usage]
+# interval_seconds = 600
+# Off by default. Turn on for a machine where you rarely run Claude Code (a
+# VPS that mostly runs other agents): the poller then refreshes an expired
+# Claude login file itself instead of reporting it "expired" until you next
+# sign in there. It rewrites ~/.claude/.credentials.json with the rotated tokens.
+# refresh_login = false
+
+# [modules.guardrails]
+# compile_slots = false     # true for Rust users: machine-wide compile slots (rustc-gate)
+# refuse_unwrapped_tests = true
+
+# [modules.cleanup]
+# worktree_age = "7d"       # clean scratch worktrees untouched this long are removed
+# cache_age = "30d"         # target/ and node_modules/ untouched this long are removed
+# log_age = "30d"
+
+# [modules.tmp-cleanup]
+# age = "1d"
+
+# [modules.post]
+# bridge = false            # true: relay mail between your machines through a private git repo
+# relay_url = ""            # the private relay repo's git URL; required with bridge = true
+# ssh_key = "~/.ssh/post-relay"   # this machine's relay key (you provision it; modules/post/README.md)
+# hooks = true              # install the mail hook for each harness under [harnesses.*] (needs Node.js)
+# install_method = "auto"   # auto = release binary, else build with cargo; or release / source
+
+# [modules.skills]
+# pool = ""                 # the skill library; "" means paths.skills (see modules/skills/README.md)
+# pool_remote = ""          # git URL of your skills repo, to use it as the pool instead of a local folder
+# repo_url = "https://github.com/treygoff24/skillherd"   # the skillherd tool; or set checkout to a local clone
+# checkout = ""             # "" means <paths.code>/skillherd

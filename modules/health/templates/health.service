@@ -1,0 +1,8 @@
+# Rendered by agent-estate (${label}) from estate.toml; do not edit here.
+[Unit]
+Description=estate health report (read-only)
+
+[Service]
+Type=oneshot
+Environment=PATH=${modules.keys.shim_dir}:${paths.bin}:/usr/local/bin:/usr/bin:/bin
+ExecStart=${paths.bin}/estate-health --quiet

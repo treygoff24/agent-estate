@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Install the /tmp age-out for this login. Idempotent; --dry-run changes nothing.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+if [ "$ESTATE_PLATFORM" = mac ]; then
+  say "nothing to install on macOS (it manages its own temp directories)"
+  exit 0
+fi
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+msg="$(valid_settings)" || { say "$msg"; exit 1; }
+render tmpfiles.conf "$TMPFILES_CONF"
+render clean-timer.conf "$TIMER_DROPIN"
+run systemctl --user daemon-reload
+run systemctl --user enable --now "$TIMER"
+say "installed: $DIR ages out after $AGE"

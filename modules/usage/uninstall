@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Remove the timer, wrapper and command. Keeps the snapshot (it is only data).
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+if [ "$ESTATE_PLATFORM" = mac ]; then
+  run launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+else
+  run systemctl --user disable --now "$LABEL.timer" 2>/dev/null || true
+fi
+for pair in "${UNITS[@]}"; do run rm -f -- "${pair#*:}"; done
+[ "$ESTATE_PLATFORM" = mac ] || run systemctl --user daemon-reload
+run rm -f -- "$WRAPPER" "$SHOW_BIN"
+say "removed the poller; $USAGE_DIR/snapshot.json is kept"

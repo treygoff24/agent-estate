@@ -1,0 +1,20 @@
+name = "guardrails"
+description = "Keep many agents on one box from melting it: testrun, compile slots, shell-footgun hook"
+platforms = ["mac", "linux"]
+requires = []
+
+[prerequisites]
+all = ["python3"]
+linux = ["systemctl", "systemd-run"]
+
+# Every setting this module reads, with its default. Override any of them
+# in estate.toml under [modules.guardrails]; an unlisted key is an error.
+[defaults]
+compile_slots = false         # also install compile-slot-gate and rustc-gate (Rust users)
+rustc_slots = 0               # max concurrent compiles machine-wide; 0 = 8 on a Mac, 12 on Linux, never above the core count
+rustc_base = 6                # slots that are always open; slots above it need memory headroom
+rustc_headroom_gb = 12        # free memory needed to open the first slot above the base (+2 GB per slot after it)
+memory_high = "80%"           # Linux: soft memory limit for all test runs together (systemd: bytes, K/M/G/T suffix, or %)
+memory_max = "90%"            # Linux: hard ceiling; past it the kernel kills inside the test slice only
+cpu_weight = 100              # Linux: CPU share of the test slice against its siblings (1-10000); no quota
+refuse_unwrapped_tests = true # footgun hook: refuse test and gate commands that do not go through testrun

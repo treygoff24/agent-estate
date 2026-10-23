@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Install the user-level half of the baseline (backup timers) and tell the
+# person the one root command for the rest. Idempotent; --dry-run changes nothing.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+if [ "$ESTATE_PLATFORM" = mac ]; then
+  say "nothing to install on macOS: it only checks Tailscale (and Time Machine if backups = true)"
+  exit 0
+fi
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+msg="$(valid_settings)" || { say "$msg"; exit 1; }
+
+if [ "$BACKUPS" = true ]; then
+  for u in $BACKUP_UNITS; do render "$u" "$UNIT_DIR/$(unit_name "$u")"; done
+  run systemctl --user daemon-reload
+  run systemctl --user enable --now "$(unit_name restic-backup.timer)" "$(unit_name restic-maintain.timer)"
+else
+  for u in restic-backup.timer restic-maintain.timer; do
+    if [ -f "$UNIT_DIR/$(unit_name "$u")" ]; then
+      run systemctl --user disable --now "$(unit_name "$u")"
+      run rm -f "$UNIT_DIR/$(unit_name "$u")"
+    fi
+  done
+fi
+
+if [ "$ESTATE_DRY_RUN" = 1 ]; then
+  say "root part (run by the person, once, with sudo):"
+  say "  $(root_setup_command) --dry-run   # preview"
+  say "  $(root_setup_command)"
+  exit 0
+fi
+linux_root_problems
+if [ -n "$FAILS" ]; then
+  say "the root half is not done yet. A person with sudo runs this once (read it first; add --dry-run to preview):"
+  printf '\n  %s\n\n' "$(root_setup_command)"
+  say "if the firewall step asks for it: bring Tailscale up (sudo tailscale up --ssh), prove ssh works over the tailnet, run the command again,"
+  say "then in a FRESH ssh session run: sudo estate-firewall confirm. Then: estate doctor"
+else
+  say "root half already in place"
+fi

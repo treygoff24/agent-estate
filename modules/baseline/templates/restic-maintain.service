@@ -1,0 +1,13 @@
+[Unit]
+Description=restic prune and integrity check (agent-estate baseline)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=${keys.file}
+Environment=RESTIC_REPOSITORY=${modules.baseline.backup_repo}
+Environment=RESTIC_CACHE_DIR=${home}/.cache/restic
+ExecStart=${estate.root}/modules/baseline/restic-maintain
+Nice=15
+IOSchedulingClass=idle

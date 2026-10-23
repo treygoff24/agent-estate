@@ -1,0 +1,7 @@
+# Rendered by agent-estate (${label}) from estate.toml; do not edit here.
+[Unit]
+Description=take down expired estate-show links
+
+[Service]
+Type=oneshot
+ExecStart=${paths.bin}/estate-show reap

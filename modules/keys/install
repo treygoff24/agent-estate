@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec python3 "$ESTATE_MODULE_DIR/keys.py" install "$@"

@@ -1,0 +1,41 @@
+# House skills: written in this repo, or deliberate forks whose edits outrank upstream.
+# One name per line; `skillherd doctor` reports pool entries that are neither tracked
+# upstream (.npx/<name>.json) nor named here. Provenance for each: PROVENANCE.md.
+
+# Written here
+task-design
+no-ceremony
+debugging-systematic
+premortem
+codebase-mapping
+coverage-architect
+quality-gate
+review-until-dry
+hillclimb
+operationalizing-expertise
+open-source-readiness
+oss-launch
+codex-prompting
+rust-agent-cli
+writing
+visual-qa-harness
+vqa-fresh-eyes
+
+# Vendored from upstream with local edits (upstream no longer overwrites them)
+test-value-audit
+receiving-code-review
+writing-for-agents
+triage-issue
+grilling
+tdd
+code-review
+triage
+domain-modeling
+codebase-design
+improve-codebase-architecture
+wayfinder
+teach
+brainstorming
+rust-engineer
+supabase-postgres-best-practices
+interaction-design

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Remove the backup timers. The root half (user, sshd, firewall, updates) is
+# deliberately left: removing a firewall or SSH policy blindly is how people lock themselves out.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+[ "$ESTATE_PLATFORM" = mac ] && exit 0
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+for u in restic-backup.timer restic-maintain.timer; do
+  [ -f "$UNIT_DIR/$(unit_name "$u")" ] && run systemctl --user disable --now "$(unit_name "$u")"
+done
+for u in $BACKUP_UNITS; do run rm -f "$UNIT_DIR/$(unit_name "$u")"; done
+run systemctl --user daemon-reload
+say "backup timers removed. Root-level changes (agents' login, sshd drop-in, firewall, updates) were left in place;"
+say "to drop the firewall: sudo nft delete table inet estate; sudo rm /etc/nftables.conf"

@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""estate-config-sync: install your agent-env repo into $HOME. See README.md."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from config_sync import main  # noqa: E402
+
+sys.exit(main())

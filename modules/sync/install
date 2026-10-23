@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Install the nightly sync: estate-sync on PATH, a starter repo table, and the
+# systemd user timer (Linux) or launchd agent (Mac). Idempotent; --dry-run changes nothing.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+msg="$(valid_settings)" || { say "$msg"; exit 1; }
+
+run mkdir -p "$BIN_DIR" "$STATE_DIR/sync"
+run ln -sfn "$ESTATE_MODULE_DIR/estate-sync" "$SYNC_BIN"
+
+if [ ! -e "$REPOS_FILE" ]; then
+  if [ "$ESTATE_DRY_RUN" = 1 ]; then
+    say "would write: $REPOS_FILE (starter repo table)"
+  else
+    mkdir -p "$(dirname "$REPOS_FILE")"
+    cat > "$REPOS_FILE" <<'TABLE'
+# estate-sync repo table: one repo per line, tab-separated columns:
+#   name <TAB> path <TAB> install command
+# path: where the checkout lives; empty or "-" means <paths.code>/<name>.
+# The remote is <git.remote_base>/<name>.git. The repo is cloned if missing and
+# fast-forwarded otherwise; a dirty or diverged checkout is skipped, never touched.
+# The install command (optional) runs with `bash -c` in the repo after a pull that
+# moved HEAD (or a fresh clone). Exit 75 means "not now, retry next run".
+# Example (a repo named dotfiles, no install step):
+# dotfiles
+TABLE
+    say "wrote: $REPOS_FILE (starter repo table; add your repos)"
+  fi
+fi
+
+if [ "$ESTATE_PLATFORM" = mac ]; then
+  render sync.plist "$PLIST"
+  run launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  run launchctl bootstrap "gui/$(id -u)" "$PLIST"
+else
+  render sync.service "$SERVICE"
+  render sync.timer "$TIMER_FILE"
+  run systemctl --user daemon-reload
+  run systemctl --user enable --now "$TIMER"
+fi
+say "installed: repos pulled daily at $WHEN"

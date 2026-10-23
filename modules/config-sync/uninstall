@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Remove the estate-config-sync command. Leaves the agent-env checkout, the files it
+# installed and the state in place: removing those would delete your configuration.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+if [ -L "$BIN/$TOOL_NAME" ]; then
+  run rm -f -- "$BIN/$TOOL_NAME"
+  say "removed $BIN/$TOOL_NAME; the checkout at $REPO and the installed config stay"
+fi

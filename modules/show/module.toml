@@ -1,0 +1,12 @@
+name = "show"
+description = "Publish a file, directory or dev port as a link on your tailnet, with a time limit"
+platforms = ["linux"]
+requires = []
+
+[prerequisites]
+linux = ["systemctl", "python3"]
+
+# Every setting this module reads, with its default. Override in estate.toml
+# under [modules.show]; an unlisted key is an error.
+[defaults]
+reap_minutes = 1      # how often expired links are taken down (a link also dies on the next estate-show command)

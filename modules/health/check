@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Doctor check: the health job is installed and has run within its interval.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+fix="run: estate install health"
+[ "$(readlink "$BIN/estate-health" 2>/dev/null)" = "$ESTATE_MODULE_DIR/estate-health" ] \
+  || fail "not installed: $BIN/estate-health is missing or points elsewhere ($fix)" "$DONE_WHEN"
+if [ "$ESTATE_PLATFORM" = mac ]; then
+  [ -f "$PLIST" ] || fail "not installed: $PLIST is missing ($fix)" "$DONE_WHEN"
+  pinned_python || fail "the pinned Python 3.11+ ($(pin_file)) is missing or no longer works: launchd would run the job with the wrong interpreter ($fix)" "$DONE_WHEN"
+  rendered_pinned health.plist | cmp -s - "$PLIST" \
+    || fail "$PLIST does not match estate.toml ($fix)" "$DONE_WHEN"
+  launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 \
+    || fail "$LABEL is not loaded in launchd ($fix)" "$DONE_WHEN"
+else
+  for pair in "health.service:$SERVICE" "health.timer:$TIMER_FILE"; do
+    tpl="${pair%%:*}" dest="${pair#*:}"
+    [ -f "$dest" ] || fail "not installed: $dest is missing ($fix)" "$DONE_WHEN"
+    estate render "$ESTATE_MODULE_DIR/templates/$tpl" | cmp -s - "$dest" \
+      || fail "$dest does not match estate.toml ($fix)" "$DONE_WHEN"
+  done
+  systemctl --user is-enabled --quiet "$TIMER" || fail "$TIMER is not enabled ($fix)" "$DONE_WHEN"
+  systemctl --user is-active --quiet "$TIMER" || fail "$TIMER is not active ($fix)" "$DONE_WHEN"
+fi
+report="$STATE/latest.json"
+[ -f "$report" ] || warn "installed, but no report yet (the first run is due within the hour; or run estate-health)" "$DONE_WHEN"
+mtime="$(stat -c %Y "$report" 2>/dev/null || stat -f %m "$report")"
+age_min=$(( ($(date +%s) - mtime) / 60 ))
+[ "$age_min" -le "$MAX_AGE_MIN" ] \
+  || fail "the last health report is ${age_min} minutes old: the hourly job is not running" "$DONE_WHEN"
+ok "hourly health report is current (${age_min} min old); read it with estate-health" "$DONE_WHEN"

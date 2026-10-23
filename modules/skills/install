@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Install skillherd, seed a new pool from the starter skills, activate and render them
+# into the harnesses, and register the checkout for the nightly sync. Idempotent;
+# --dry-run changes nothing. A pool that already has skills in it is never touched.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+msg="$(valid_settings)" || { say "$msg"; exit 1; }
+[ -z "$POOL_NOTE" ] || say "$POOL_NOTE"
+
+# 1. The tool's checkout (a local clone also works: set checkout).
+if [ ! -d "$CHECKOUT/.git" ]; then
+  [ ! -e "$CHECKOUT" ] || { say "$CHECKOUT exists but is not a git checkout; move it or set modules.skills.checkout"; exit 1; }
+  run mkdir -p "$(dirname "$CHECKOUT")"
+  run git clone "$REPO_URL" "$CHECKOUT" \
+    || { say "cannot clone $REPO_URL. Check the network and the URL, or clone it yourself and set modules.skills.checkout to that folder"; exit 1; }
+fi
+if [ "$ESTATE_DRY_RUN" = 1 ] && [ ! -d "$CHECKOUT/.git" ]; then
+  say "dry run: nothing after the clone can be previewed until $CHECKOUT exists"
+  exit 0
+fi
+HEAD_SHA="$(git -C "$CHECKOUT" rev-parse HEAD)"
+
+# 2. The tool itself, with its own installer: rebuilt only when the checkout moved.
+if [ -x "$BIN/skillherd" ] && [ "$(cat "$STAMP" 2>/dev/null || true)" = "$HEAD_SHA" ]; then
+  say "skillherd is current ($BIN/skillherd)"
+else
+  command -v cargo >/dev/null 2>&1 || [ "$ESTATE_DRY_RUN" = 1 ] \
+    || { say "cargo is not available: skillherd builds from source, which needs Rust (install rustup from https://rustup.rs as this user) and a C linker (Mac: xcode-select --install; Linux: have the person with root run apt-get install -y build-essential). Then re-run"; exit 1; }
+  (cd "$CHECKOUT" && run bash install.sh --prefix "$(dirname "$BIN")")
+  if [ "$ESTATE_DRY_RUN" != 1 ]; then
+    [ -x "$BIN/skillherd" ] || { say "install.sh finished but $BIN/skillherd is missing (is $CHECKOUT an old skill-cli clone? point modules.skills.checkout at a skillherd clone)"; exit 1; }
+    mkdir -p "$HERD_STATE"
+    printf '%s\n' "$HEAD_SHA" > "$STAMP"
+  fi
+fi
+
+# 3. The tool's configuration, written once: the library path and optional remote.
+# A config left by skill-cli (the tool's earlier name) is copied over, since that is the
+# file that was in effect; skillherd does not read the old path.
+if [ -e "$HERD_CONFIG_FILE" ]; then
+  say "keeping the existing $HERD_CONFIG_FILE"
+elif [ -f "$OLD_CONFIG_FILE" ]; then
+  if [ "$ESTATE_DRY_RUN" = 1 ]; then
+    say "would copy skill-cli's $OLD_CONFIG_FILE to $HERD_CONFIG_FILE"
+  else
+    mkdir -p "$(dirname "$HERD_CONFIG_FILE")"
+    cp "$OLD_CONFIG_FILE" "$HERD_CONFIG_FILE"
+    say "copied skill-cli's $OLD_CONFIG_FILE to $HERD_CONFIG_FILE (the old file is no longer read)"
+  fi
+elif [ "$ESTATE_DRY_RUN" = 1 ]; then
+  say "would write: $HERD_CONFIG_FILE (library $POOL)"
+else
+  mkdir -p "$(dirname "$HERD_CONFIG_FILE")"
+  HERD_POOL="$POOL" HERD_REMOTE="$REMOTE" python3 -c \
+    'import json, os; c = {"library": os.environ["HERD_POOL"]}; r = os.environ["HERD_REMOTE"]
+if r: c["remote"] = r
+print(json.dumps(c, indent=2))' > "$HERD_CONFIG_FILE"
+fi
+
+# 4. The pool. A git-remote pool is cloned by `skillherd sync`; a plain folder is seeded once,
+# and only when it holds no skills yet. Seeding copies; nothing is linked.
+has_skills() { [ -d "$POOL" ] && find "$POOL" -mindepth 2 -maxdepth 2 -name SKILL.md -print -quit 2>/dev/null | grep -q .; }
+seeded=0
+if [ -n "$REMOTE" ]; then
+  say "pool is the git remote $REMOTE; skillherd sync clones or fast-forwards it"
+elif has_skills; then
+  say "pool $POOL already has skills; leaving it untouched"
+elif [ "$SEED" != true ]; then
+  run mkdir -p "$POOL"
+  say "seed = false: created an empty pool at $POOL"
+else
+  run mkdir -p "$POOL"
+  while IFS= read -r s; do
+    src="$STARTER/$s"; [ -d "$src" ] || src="$HEALTH_SKILL"
+    run cp -R "$src" "$POOL/$s"
+  done < <(starter_skills)
+  # The tool wants every pool entry tracked upstream or declared house, or `skillherd doctor`
+  # reports unknown_provenance: the starter skills are ours, so declare them.
+  house="$POOL/.globals/house"
+  if [ "$ESTATE_DRY_RUN" = 1 ]; then
+    say "would declare the seeded skills in $house"
+  else
+    mkdir -p "$POOL/.globals"
+    [ -f "$house" ] || printf '%s\n' "# House skills: written here, or deliberate forks whose edits outrank upstream." \
+      "# One name per line; \`skillherd doctor\` reports pool entries that are neither" \
+      "# tracked upstream (.npx/<name>.json) nor named here." > "$house"
+    while IFS= read -r s; do
+      awk -v n="$s" '{sub(/#.*/, ""); if ($1 == n) f = 1} END {exit !f}' "$house" \
+        || printf '%s  # seeded by estate install skills\n' "$s" >> "$house"
+    done < <(starter_skills)
+  fi
+  seeded=1
+  say "seeded $POOL with the starter skills and the estate-health triage skill"
+fi
+
+# The tool prints a large JSON report for each command; keep it out of the install output
+# and show it only when the command fails.
+quiet() {
+  if [ "$ESTATE_DRY_RUN" = 1 ]; then run "$@"; return; fi
+  local out rc=0; out="$("$@" 2>&1)" || rc=$?
+  [ "$rc" -eq 0 ] || printf '%s\n' "$out" >&2
+  return "$rc"
+}
+
+# 5. Activate what we seeded (a library is inert until a skill is switched on), then render.
+HERD="$BIN/skillherd"
+if [ -n "$REMOTE" ]; then
+  quiet "$HERD" sync
+else
+  if [ "$seeded" = 1 ]; then
+    names=()
+    while IFS= read -r s; do names+=("$s"); done < <(starter_skills)
+    quiet "$HERD" --pool "$POOL" on "${names[@]}"
+  fi
+  quiet "$HERD" --pool "$POOL" render
+fi
+
+# 6. Nightly update of the tool itself. A row this module wrote under the tool's earlier
+# name (skill-cli, whose repo is archived) is dropped; any other row is left alone.
+old_row() { awk -F'\t' -v n="$OLD_ROW_NAME" '$1==n && $3 ~ /\/bin\/estate install skills$/' "$REPOS_FILE"; }
+if [ -f "$REPOS_FILE" ] && [ -n "$(old_row)" ]; then
+  if [ "$ESTATE_DRY_RUN" = 1 ]; then
+    say "would drop the old $OLD_ROW_NAME row from $REPOS_FILE"
+  else
+    tmp="$(mktemp "$REPOS_FILE.XXXXXX")"
+    awk -F'\t' -v n="$OLD_ROW_NAME" '!($1==n && $3 ~ /\/bin\/estate install skills$/)' "$REPOS_FILE" > "$tmp"
+    mv "$tmp" "$REPOS_FILE"
+    say "dropped the old $OLD_ROW_NAME row from $REPOS_FILE (the tool is skillherd now)"
+  fi
+fi
+if [ "$REGISTER" = true ]; then
+  row="$(printf 'skillherd\t%s\t%s install skills' "$CHECKOUT" "$ESTATE_ROOT/bin/estate")"
+  if [ -f "$REPOS_FILE" ] && awk -F'\t' '$1=="skillherd"{f=1} END{exit !f}' "$REPOS_FILE"; then
+    say "sync row for skillherd already present in $REPOS_FILE"
+  elif [ "$ESTATE_DRY_RUN" = 1 ]; then
+    say "would add the skillherd row to $REPOS_FILE"
+  else
+    mkdir -p "$(dirname "$REPOS_FILE")"
+    printf '%s\n' "$row" >> "$REPOS_FILE"
+    say "added a skillherd row to $REPOS_FILE (nightly update)"
+  fi
+fi
+hooks="$(cfg modules.sync.hooks 2>/dev/null || true)"
+if printf '%s\n' "$hooks" | grep -qx "$OLD_HOOK_LINE"; then
+  say "installed and rendered. In [modules.sync] hooks in estate.toml, replace \"$OLD_HOOK_LINE\" with \"$HOOK_LINE\": the skill command is now skillherd"
+elif printf '%s\n' "$hooks" | grep -qx "$HOOK_LINE"; then
+  say "installed; the pool is rendered into the harnesses and re-rendered nightly"
+else
+  say "installed and rendered. Add \"$HOOK_LINE\" to [modules.sync] hooks in estate.toml so every night re-renders the pool"
+fi

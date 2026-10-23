@@ -1,0 +1,6 @@
+# ship: taking a tool public.
+# Install: cd <repo> && skill add @ship
+
+open-source-readiness
+oss-launch
+rust-agent-cli

@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""estate-cleanup: a deterministic cleanup and census, run every six hours.
+
+    estate-cleanup run [--dry-run]    sweep, census, report orphans
+    estate-cleanup last               print when the last run finished (JSON)
+
+It deletes only what it can prove is regenerable junk and old enough:
+
+  * clean git worktrees in scratch locations (<code>/*-worktrees/*, <repo>/.worktrees/*)
+    untouched for `worktree_age`, removed with `git worktree remove` (never --force: a
+    worktree with uncommitted or untracked work is kept; its branch is kept too)
+  * `target/` next to a Cargo.toml and `node_modules/` next to a package.json, under
+    paths.code, with nothing modified inside for `cache_age`
+  * `*.log` files under the state directory (and any `log_dirs`) older than `log_age`,
+    and cleanup's own event files older than `events_age`
+
+It never touches /tmp (the tmp-cleanup module owns that). It REPORTS orphaned processes
+(parent is init, long-running, and in a deleted or scratch working directory or burning
+CPU) and never signals one. Every action is one JSON line in
+$ESTATE_STATE/cleanup/events-YYYYMMDD.jsonl.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(os.environ.get("ESTATE_ROOT") or Path(__file__).resolve().parents[2])
+sys.path.insert(0, str(ROOT / "lib"))
+from estate import config as C  # noqa: E402
+from estate import modules as M  # noqa: E402
+
+UNITS = {"s": 1, "m": 60, "min": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+MAX_DEPTH = 4   # how deep under paths.code to look for projects
+
+
+def age_s(text):
+    m = re.fullmatch(r"(\d+)(s|min|m|h|d|w)", str(text))
+    if not m or int(m.group(1)) == 0:
+        raise ValueError(f"{text!r} is not an age like 12h, 7d or 2w")
+    return int(m.group(1)) * UNITS[m.group(2)]
+
+
+class Events:
+    def __init__(self, state, dry):
+        self.dir = Path(state) / "cleanup"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.dry = dry
+        self.counts = {}
+        self.bytes_freed = 0
+
+    def emit(self, kind, summary, **fields):
+        now = time.time()
+        ev = {"ts": datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "epoch": int(now), "source": "cleanup", "kind": kind, "summary": summary,
+              "dry_run": self.dry, **fields}
+        day = datetime.fromtimestamp(now, timezone.utc).strftime("%Y%m%d")
+        with open(self.dir / f"events-{day}.jsonl", "a") as f:
+            f.write(json.dumps(ev) + "\n")
+        self.counts[kind] = self.counts.get(kind, 0) + 1
+        if kind == "deleted":
+            self.bytes_freed += int(fields.get("bytes", 0))
+
+
+def tree_bytes(p):
+    total = 0
+    stack = [p]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for e in it:
+                    try:
+                        st = e.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    total += st.st_size
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+        except OSError:
+            continue
+    return total
+
+
+def recently_touched(p, cutoff, skip=()):
+    """True if p or anything inside it was modified at or after cutoff. Stops at the first
+    such entry, so a live tree costs almost nothing. An unreadable entry counts as recent:
+    when in doubt, keep."""
+    stack = [p]
+    try:
+        if os.lstat(p).st_mtime >= cutoff:
+            return True
+    except OSError:
+        return True
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for e in it:
+                    if e.name in skip:
+                        continue
+                    if e.stat(follow_symlinks=False).st_mtime >= cutoff:
+                        return True
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+        except OSError:
+            return True
+    return False
+
+
+def inside(child, parent):
+    c, p = os.path.realpath(child), os.path.realpath(parent)
+    return c != p and c.startswith(p + os.sep)
+
+
+def git(*args, cwd=None):
+    try:
+        p = subprocess.run(["git", *args], capture_output=True, text=True, cwd=cwd, timeout=60,
+                           stdin=subprocess.DEVNULL)
+        return p.returncode, p.stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, str(e)
+
+
+# ---- sweeps ---------------------------------------------------------------
+
+def repos_under(code):
+    code = Path(code)
+    if not code.is_dir():
+        return []
+    return sorted(p for p in code.iterdir() if (p / ".git").is_dir() and not p.is_symlink())
+
+
+def is_scratch_location(wt):
+    parent = wt.parent.name
+    return parent == ".worktrees" or parent.endswith("-worktrees")
+
+
+def sweep_worktrees(cfg, s, ev, now):
+    cutoff = now - age_s(s["worktree_age"])
+    seen = 0
+    for repo in repos_under(cfg["paths"]["code"]):
+        rc, out = git("-C", str(repo), "worktree", "list", "--porcelain")
+        if rc != 0:
+            continue
+        blocks = [b for b in out.strip().split("\n\n") if b.strip()][1:]   # first is the main tree
+        for b in blocks:
+            lines = dict(ln.partition(" ")[::2] for ln in b.splitlines())
+            wt = Path(lines.get("worktree", ""))
+            seen += 1
+            if "locked" in lines:
+                ev.emit("kept", f"worktree locked: {wt}", path=str(wt), reason="locked")
+                continue
+            if not wt.exists():
+                if ev.dry:
+                    ev.emit("would-prune", f"stale worktree record for {wt}", path=str(wt), repo=str(repo))
+                else:
+                    rc, _ = git("-C", str(repo), "worktree", "prune")
+                    ev.emit("pruned" if rc == 0 else "failed", f"pruned record for missing {wt}",
+                            path=str(wt), repo=str(repo))
+                continue
+            if not is_scratch_location(wt):
+                continue
+            rc, gd = git("-C", str(wt), "rev-parse", "--absolute-git-dir")
+            marks = [Path(gd.strip()) / n for n in ("HEAD", "index", "logs/HEAD")] if rc == 0 else []
+            newest = max([m.stat().st_mtime for m in marks if m.exists()] or [now])
+            if newest >= cutoff or recently_touched(str(wt), cutoff):
+                continue
+            rc, status = git("-C", str(wt), "status", "--porcelain")
+            if rc != 0 or status.strip():
+                ev.emit("kept", f"worktree has uncommitted or untracked work: {wt}",
+                        path=str(wt), reason="dirty")
+                continue
+            size = tree_bytes(wt)
+            branch = lines.get("branch", "(detached)").removeprefix("refs/heads/")
+            if ev.dry:
+                ev.emit("would-delete", f"worktree {wt}", path=str(wt), bytes=size, branch=branch)
+                continue
+            rc, err = git("-C", str(repo), "worktree", "remove", str(wt))
+            if rc == 0:
+                ev.emit("deleted", f"worktree {wt}", path=str(wt), bytes=size, branch=branch)
+            else:
+                ev.emit("failed", f"could not remove worktree {wt}: {err.strip()}", path=str(wt))
+    return seen
+
+
+def find_caches(code):
+    """Yield (dir, kind) for target/ beside Cargo.toml and node_modules/ beside package.json."""
+    code = str(code)
+    if not os.path.isdir(code):
+        return
+    base_depth = code.rstrip(os.sep).count(os.sep)
+    for dirpath, dirs, files in os.walk(code, followlinks=False):
+        depth = dirpath.count(os.sep) - base_depth
+        found = []
+        if "target" in dirs and "Cargo.toml" in files:
+            found.append("target")
+        if "node_modules" in dirs and "package.json" in files:
+            found.append("node_modules")
+        for name in found:
+            yield os.path.join(dirpath, name), name
+        dirs[:] = [d for d in dirs if d not in (".git", "target", "node_modules") and
+                   not os.path.islink(os.path.join(dirpath, d))]
+        if depth >= MAX_DEPTH:
+            dirs[:] = []
+
+
+def sweep_caches(cfg, s, ev, now):
+    code = cfg["paths"]["code"]
+    cutoff = now - age_s(s["cache_age"])
+    kept = 0
+    for path, kind in find_caches(code):
+        if os.path.islink(path) or not inside(path, code):
+            continue
+        if recently_touched(path, cutoff):
+            kept += 1
+            continue
+        size = tree_bytes(path)
+        if ev.dry:
+            ev.emit("would-delete", f"{kind} cache {path}", path=path, bytes=size)
+            continue
+        try:
+            shutil.rmtree(path)
+            ev.emit("deleted", f"{kind} cache {path}", path=path, bytes=size)
+        except OSError as e:
+            ev.emit("failed", f"could not remove {path}: {e}", path=path)
+    return kept
+
+
+LOG_RE = re.compile(r"\.log(\.\d+)?(\.gz)?$")
+
+
+def sweep_files(root, pattern, cutoff, ev, skip_dirs=()):
+    root = str(root)
+    if not os.path.isdir(root):
+        return
+    for dirpath, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = [d for d in dirs if os.path.join(dirpath, d) not in skip_dirs
+                   and not os.path.islink(os.path.join(dirpath, d))]
+        for name in files:
+            p = os.path.join(dirpath, name)
+            if not pattern.search(name) or os.path.islink(p):
+                continue
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if st.st_mtime >= cutoff:
+                continue
+            if ev.dry:
+                ev.emit("would-delete", f"log {p}", path=p, bytes=st.st_size)
+                continue
+            try:
+                os.unlink(p)
+                ev.emit("deleted", f"log {p}", path=p, bytes=st.st_size)
+            except OSError as e:
+                ev.emit("failed", f"could not remove {p}: {e}", path=p)
+
+
+def sweep_logs(cfg, s, ev, now):
+    state = cfg["paths"]["state"]
+    cutoff = now - age_s(s["log_age"])
+    own = os.path.join(state, "cleanup")
+    sweep_files(state, LOG_RE, cutoff, ev, skip_dirs=(own,))
+    for d in s["log_dirs"]:
+        sweep_files(os.path.expanduser(d), LOG_RE, cutoff, ev)
+    sweep_files(own, re.compile(r"^events-\d{8}\.jsonl$"), now - age_s(s["events_age"]), ev)
+
+
+# ---- census and orphan report ---------------------------------------------
+
+def etime_s(text):
+    days, _, rest = text.rpartition("-")
+    secs = 0
+    for part in rest.split(":"):
+        secs = secs * 60 + int(part)
+    return secs + (int(days) * 86400 if days else 0)
+
+
+def report_orphans(s, ev, platform):
+    """Report only: this file has no code path that ends a process."""
+    try:
+        p = subprocess.run(["ps", "-axo", "pid=,ppid=,etime=,pcpu=,comm="], capture_output=True,
+                           text=True, timeout=20, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        ev.emit("info", f"orphan scan skipped: ps unavailable ({e})")
+        return 0
+    proc = Path(os.environ.get("ESTATE_CLEANUP_PROC", "/proc"))
+    min_age = int(s["orphan_hours"]) * 3600
+    min_cpu = float(s["orphan_cpu"])
+    n = 0
+    for ln in p.stdout.splitlines():
+        f = ln.split(None, 4)
+        try:
+            pid, ppid, et, cpu, comm = int(f[0]), int(f[1]), etime_s(f[2]), float(f[3]), f[4]
+        except (IndexError, ValueError):
+            continue
+        if ppid != 1 or et < min_age or pid == os.getpid():
+            continue
+        reasons = []
+        if platform == "linux":
+            try:
+                cwd = os.readlink(proc / str(pid) / "cwd")
+            except OSError:
+                cwd = ""
+            if cwd.endswith(" (deleted)"):
+                reasons.append("deleted-cwd")
+            elif cwd.startswith("/tmp/") or "/.worktrees/" in cwd or "-worktrees/" in cwd:
+                reasons.append("stale-scratch")
+        else:
+            cwd = ""
+        if cpu >= min_cpu:
+            reasons.append("runaway-cpu")
+        if reasons:
+            n += 1
+            ev.emit("orphan", f"{os.path.basename(comm)} pid {pid}: {', '.join(reasons)} "
+                    "(reported only; not signalled)",
+                    pid=pid, command=os.path.basename(comm), reasons=reasons,
+                    age_hours=et // 3600, cpu_pct=cpu, cwd=cwd or None)
+    return n
+
+
+def census(cfg, ev, worktrees, caches_kept, orphans):
+    u = shutil.disk_usage(Path.home())
+    ev.emit("census", f"home volume {round(100 * u.used / u.total, 1)}% used",
+            used_pct=round(100 * u.used / u.total, 1), free_bytes=u.free,
+            linked_worktrees=worktrees, build_caches_kept=caches_kept, orphans=orphans)
+
+
+def cmd_run(args):
+    cfg = C.load(None, M.discover())
+    s = cfg["modules"]["cleanup"]
+    platform = C.current_platform()
+    try:
+        for k in ("worktree_age", "cache_age", "log_age", "events_age"):
+            age_s(s[k])
+    except ValueError as e:
+        print(f"estate-cleanup: modules.cleanup: {e}", file=sys.stderr)
+        return 2
+    ev = Events(cfg["paths"]["state"], args.dry_run)
+    now = time.time()
+    worktrees = sweep_worktrees(cfg, s, ev, now)
+    caches_kept = sweep_caches(cfg, s, ev, now)
+    sweep_logs(cfg, s, ev, now)
+    orphans = report_orphans(s, ev, platform)
+    census(cfg, ev, worktrees, caches_kept, orphans)
+    summary = {"finished_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+               "epoch": int(time.time()), "dry_run": args.dry_run, "events": ev.counts,
+               "bytes_freed": ev.bytes_freed}
+    if not args.dry_run:
+        tmp = ev.dir / "last-run.json.tmp"
+        tmp.write_text(json.dumps(summary) + "\n")
+        os.replace(tmp, ev.dir / "last-run.json")
+    print(json.dumps(summary) if args.json else
+          f"cleanup{' (dry run)' if args.dry_run else ''}: " +
+          (", ".join(f"{n} {k}" for k, n in sorted(ev.counts.items())) or "nothing to do") +
+          f"; {ev.bytes_freed // 2**20} MiB freed")
+    return 0
+
+
+def cmd_last(args):
+    cfg = C.load(None, M.discover())
+    f = Path(cfg["paths"]["state"]) / "cleanup" / "last-run.json"
+    if not f.is_file():
+        print("estate-cleanup: no run on record", file=sys.stderr)
+        return 1
+    print(f.read_text().strip())
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="estate-cleanup", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run", help="sweep, census, report orphans")
+    r.add_argument("--dry-run", action="store_true", help="log would-delete events; delete nothing")
+    r.add_argument("--json", action="store_true")
+    r.set_defaults(fn=cmd_run)
+    sub.add_parser("last", help="print the last run's summary").set_defaults(fn=cmd_last)
+    args = ap.parse_args()
+    try:
+        return args.fn(args)
+    except (C.ConfigError, M.ModuleError) as e:
+        print(f"estate-cleanup: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

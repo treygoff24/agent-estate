@@ -1,0 +1,19 @@
+[Unit]
+Description=restic backup of the agents' home (agent-estate baseline)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# RESTIC_PASSWORD and the repository's access keys come from the key file.
+EnvironmentFile=${keys.file}
+Environment=RESTIC_REPOSITORY=${modules.baseline.backup_repo}
+Environment="BASELINE_BACKUP_PATHS=${modules.baseline.backup_paths}"
+Environment=BASELINE_KEEP_DAILY=${modules.baseline.keep_daily}
+Environment=BASELINE_KEEP_WEEKLY=${modules.baseline.keep_weekly}
+Environment=BASELINE_KEEP_MONTHLY=${modules.baseline.keep_monthly}
+Environment=ESTATE_STATE=${paths.state}
+Environment=RESTIC_CACHE_DIR=${home}/.cache/restic
+ExecStart=${estate.root}/modules/baseline/restic-backup
+Nice=10
+IOSchedulingClass=idle

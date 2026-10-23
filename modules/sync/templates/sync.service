@@ -1,0 +1,8 @@
+# Rendered by agent-estate (${label}) from estate.toml; do not edit here.
+[Unit]
+Description=agent-estate nightly sync (repos, then hooks)
+
+[Service]
+Type=oneshot
+Environment=PATH=${paths.bin}:/usr/local/bin:/usr/bin:/bin
+ExecStart=${paths.bin}/estate-sync

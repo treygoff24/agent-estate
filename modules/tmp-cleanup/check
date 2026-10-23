@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Doctor check: exit 0 ok, 1 fail, 2 warn; first line is the status.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+if [ "$ESTATE_PLATFORM" = mac ]; then
+  ok "nothing to do on macOS (it manages its own temp directories)" \
+     "always, on macOS; this module only acts on Linux"
+fi
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+msg="$(valid_settings)" || fail "$msg" "$DONE_WHEN"
+fix="run: estate install tmp-cleanup"
+for pair in "tmpfiles.conf:$TMPFILES_CONF" "clean-timer.conf:$TIMER_DROPIN"; do
+  tpl="${pair%%:*}" dest="${pair#*:}"
+  [ -f "$dest" ] || fail "not installed: $dest is missing ($fix)" "$DONE_WHEN"
+  estate render "$ESTATE_MODULE_DIR/templates/$tpl" | cmp -s - "$dest" \
+    || fail "$dest does not match estate.toml ($fix)" "$DONE_WHEN"
+done
+systemctl --user is-enabled --quiet "$TIMER" || fail "$TIMER is not enabled ($fix)" "$DONE_WHEN"
+systemctl --user is-active --quiet "$TIMER" || fail "$TIMER is not active ($fix)" "$DONE_WHEN"
+ok "$DIR ages out after $AGE (hourly sweep)" "$DONE_WHEN"

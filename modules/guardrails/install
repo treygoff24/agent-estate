@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Install testrun, the footgun hook and (optionally) the compile slots. Idempotent; --dry-run changes nothing.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+msg="$(valid_settings)" || { say "$msg"; exit 1; }
+
+# put_file DEST MODE < content: write atomically, only when it differs.
+put_file() {
+  local dest="$1" mode="$2" tmp
+  tmp="$(mktemp "$(dirname "$dest")/.guardrails.XXXXXX")" || return 1
+  cat > "$tmp"
+  if [ -f "$dest" ] && cmp -s "$tmp" "$dest" && [ "$(stat -c %a "$dest" 2>/dev/null || stat -f %Lp "$dest")" = "$mode" ]; then
+    rm -f "$tmp"; printf 'unchanged: %s\n' "$dest" >&2; return 0
+  fi
+  chmod "$mode" "$tmp" && mv -f "$tmp" "$dest" && printf 'wrote: %s\n' "$dest" >&2
+}
+
+write_to() {   # write_to DEST MODE SOURCE-CMD...: honours --dry-run
+  local dest="$1" mode="$2"; shift 2
+  if [ "$ESTATE_DRY_RUN" = 1 ]; then
+    if [ -f "$dest" ] && "$@" | cmp -s - "$dest"; then printf 'unchanged: %s\n' "$dest" >&2
+    else printf 'would write: %s\n' "$dest" >&2; fi
+  else
+    mkdir -p "$(dirname "$dest")"
+    "$@" | put_file "$dest" "$mode"
+  fi
+}
+
+for tool in "${TOOLS[@]}"; do
+  write_to "$BIN/$tool" 755 cat "$ESTATE_MODULE_DIR/bin/$tool"
+done
+write_to "$CONF_JSON" 644 conf_json
+if [ "$REFUSE_TESTS" = false ]; then
+  write_to "$SKIP_FILE" 644 skip_text
+elif [ -f "$SKIP_FILE" ]; then
+  run rm -f -- "$SKIP_FILE"
+fi
+if [ "$ESTATE_PLATFORM" = linux ]; then
+  if [ "$ESTATE_DRY_RUN" = 1 ]; then
+    if [ -f "$SLICE_FILE" ] && estate render "$ESTATE_MODULE_DIR/templates/slice.conf" | cmp -s - "$SLICE_FILE"; then
+      printf 'unchanged: %s\n' "$SLICE_FILE" >&2
+    else printf 'would write: %s\n' "$SLICE_FILE" >&2; fi
+    run systemctl --user daemon-reload
+  else
+    before="$(cat "$SLICE_FILE" 2>/dev/null || true)"
+    render slice.conf "$SLICE_FILE"
+    [ "$(cat "$SLICE_FILE")" = "$before" ] || systemctl --user daemon-reload
+  fi
+fi
+case ":$PATH:" in *":$BIN:"*) ;; *) say "note: $BIN is not on PATH in this shell; add it so agents find testrun" ;; esac
+say "installed: ${TOOLS[*]} in $BIN"
+say "next: merge $ESTATE_MODULE_DIR/settings/claude.json into ~/.claude/settings.json (config-sync does this if its manifest lists it); for Codex use settings/codex-hooks.json, then trust the hook in /hooks"

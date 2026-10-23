@@ -1,0 +1,13 @@
+name = "config-sync"
+description = "Harness config (rules, hooks, settings) kept in one git repo and installed on every machine"
+platforms = ["mac", "linux"]
+requires = []
+
+[prerequisites]
+all = ["git", "python3"]
+
+# Every setting this module reads, with its default. Override any of them
+# in estate.toml under [modules.config-sync]; an unlisted key is an error.
+[defaults]
+repo = ""     # the agent-env checkout; "" means <paths.code>/agent-env (a leading ~ is fine)
+remote = ""   # git URL of your agent-env repo; "" for none (see README: "Second machine")

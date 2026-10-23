@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Remove what install put in place. Leaves your harness settings alone: delete the footgun-hook entry there yourself.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+for tool in testrun footgun-hook compile-slot-gate rustc-gate; do
+  run rm -f -- "$BIN/$tool"
+done
+run rm -f -- "$CONF_JSON" "$SKIP_FILE"
+if [ "$ESTATE_PLATFORM" = linux ]; then
+  run rm -f -- "$SLICE_FILE"
+  run systemctl --user daemon-reload
+fi
+say "removed the guardrails commands and config; remove the footgun-hook entry from your harness settings"

@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""compile-slot-gate: machine-wide compile slots, so N agents cannot start N compilers.
+
+  compile-slot-gate rustc -- <command...>   wait for a slot, run the command, release it
+  compile-slot-gate status                  print the slot snapshot (JSON)
+
+At most RUSTC_GATE_SLOTS compiles run at once across every session and
+worktree on the machine (default: 8 on macOS, 12 on Linux, never more than the
+core count). Admission is a plain flock on slot files, so it works the same on
+Linux and macOS and a killed process frees its slot by dying.
+
+The first RUSTC_GATE_BASE slots (default 6) are always open. A slot past them
+opens only while the machine has memory headroom: available memory must be at
+least RUSTC_GATE_HEADROOM_GB (default 12) plus 2 GB for every high slot below
+it, because compiles admitted together keep growing after admission. The
+binding limit on a big box is memory, not cores.
+
+Waiting is cheap: one waiter at a time (the holder of admission.lock) probes
+the slots every 50 ms; every other waiter sleeps inside a blocking flock.
+State is published atomically (temp file, then rename) to
+$COMPILE_SLOTS_STATE_DIR/state.json (default ~/.local/state/compile-slots):
+{"updated": <epoch>, "rustc": {"in_use": n, "total": n, "queue_depth": n}}.
+Readers should treat a snapshot older than 5 seconds as unknown.
+
+Settings come from the environment, then from "rustc_slots", "rustc_base" and
+"headroom_gb" in ~/.config/agent-estate/guardrails.json (written by `estate
+install guardrails`). COMPILE_SLOT_HEADROOM_GB, if set, replaces the measured
+headroom (tests, or a box whose memory the probes misread).
+"""
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE = Path(os.environ.get("COMPILE_SLOTS_STATE_DIR") or Path.home() / ".local/state/compile-slots")
+HEAD_POLL = 0.05
+HEADROOM_RECHECK = 1.0
+
+
+def config_dir():
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "agent-estate"
+
+
+def conf():
+    path = os.environ.get("TESTRUN_CONFIG") or str(config_dir() / "guardrails.json")
+    try:
+        data = json.loads(Path(path).read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def setting(env, key, default):
+    raw = os.environ.get(env)
+    if raw in (None, ""):
+        raw = conf().get(key)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def total_slots():
+    default = min(os.cpu_count() or 4, 8 if sys.platform == "darwin" else 12)
+    configured = setting("RUSTC_GATE_SLOTS", "rustc_slots", 0)
+    return configured if configured > 0 else max(1, default)
+
+
+def headroom_gb():
+    """Memory a new compile can still grow into, in GB."""
+    forced = os.environ.get("COMPILE_SLOT_HEADROOM_GB")
+    if forced:
+        return float(forced)
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+            size = int(re.search(r"page size of (\d+) bytes", out).group(1))
+            pages = 0
+            for label in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
+                m = re.search(rf"{label}:\s+(\d+)", out)
+                pages += int(m.group(1)) if m else 0
+            return pages * size / 2**30
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                avail = int(line.split()[1]) / 2**20
+                break
+        else:
+            return 1e9
+        # A container's cgroup limit can be tighter than the host: anon+shmem are
+        # not reclaimable, file cache is.
+        cg = Path(os.environ.get("COMPILE_SLOT_CGROUP_DIR", "/sys/fs/cgroup"))
+        limit = (cg / "memory.max").read_text().strip()
+        if limit.isdigit():
+            stat = dict(l.split() for l in (cg / "memory.stat").read_text().splitlines())
+            used = int(stat.get("anon", 0)) + int(stat.get("shmem", 0))
+            avail = min(avail, (int(limit) - used) / 2**30)
+        return avail
+    except (OSError, AttributeError, ValueError):
+        return 1e9  # unreadable: do not block compiles
+
+
+def try_lock(handle):
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def probe_in_use(total):
+    """Slots some process holds right now (probed through a fresh descriptor)."""
+    used = 0
+    for i in range(1, total + 1):
+        path = STATE / "locks" / f"slot-{i}"
+        if not path.exists():
+            continue
+        with path.open("a+") as h:
+            if try_lock(h):
+                fcntl.flock(h, fcntl.LOCK_UN)
+            else:
+                used += 1
+    return used
+
+
+def probe_waiting():
+    n = 0
+    for path in (STATE / "locks").glob("wait-*"):
+        try:
+            h = path.open("r")
+        except OSError:
+            continue
+        with h:
+            if try_lock(h):
+                fcntl.flock(h, fcntl.LOCK_UN)
+            else:
+                n += 1
+    return n
+
+
+def publish(total):
+    snap = {"updated": time.time(),
+            "rustc": {"in_use": probe_in_use(total), "total": total, "queue_depth": probe_waiting()}}
+    tmp = STATE / f"state.json.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(snap))
+    os.replace(tmp, STATE / "state.json")
+
+
+def run_rustc(command):
+    total = total_slots()
+    base = max(1, min(total, setting("RUSTC_GATE_BASE", "rustc_base", 6)))
+    minimum = setting("RUSTC_GATE_HEADROOM_GB", "headroom_gb", 12)
+    locks = STATE / "locks"
+    locks.mkdir(parents=True, exist_ok=True)
+
+    def interrupted(signum, _frame):
+        raise SystemExit(128 + signum)
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, interrupted)
+
+    ticket = (locks / f"wait-{time.time_ns()}-{os.getpid()}").open("w")
+    fcntl.flock(ticket, fcntl.LOCK_EX)
+    held = None
+    handles = {}
+    try:
+        publish(total)
+        admission = (locks / "admission.lock").open("a+")
+        fcntl.flock(admission, fcntl.LOCK_EX)  # blocking: only the head of the line gets past
+        room, room_at, announced = 0.0, None, False
+        try:
+            while held is None:
+                for i in range(1, total + 1):
+                    if i > base:
+                        now = time.monotonic()
+                        if room_at is None or now - room_at >= HEADROOM_RECHECK:
+                            room, room_at = headroom_gb(), now
+                        if room < minimum + 2 * (i - base - 1):
+                            break
+                    handle = handles.get(i) or (locks / f"slot-{i}").open("a+")
+                    handles[i] = handle
+                    if try_lock(handle):
+                        held = i
+                        break
+                if held is None:
+                    if not announced:
+                        print("compile-slot-gate: waiting for a compile slot", file=sys.stderr)
+                        announced = True
+                    time.sleep(HEAD_POLL)
+        finally:
+            fcntl.flock(admission, fcntl.LOCK_UN)
+            admission.close()
+        for i in [k for k in handles if k != held]:
+            handles.pop(i).close()
+        ticket.close()
+        (locks / Path(ticket.name).name).unlink(missing_ok=True)
+        publish(total)
+        # close_fds: no lock descriptor may leak into the compiler, or a daemon it
+        # leaves behind would pin the slot.
+        child = subprocess.Popen(command, close_fds=True)
+
+        def forward(signum, _frame):
+            if child.poll() is None:
+                child.send_signal(signum)
+        for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(s, forward)
+        while True:
+            try:
+                rc = child.wait(timeout=2)
+                break
+            except subprocess.TimeoutExpired:
+                try:
+                    publish(total)
+                except OSError:
+                    pass
+        return rc if rc >= 0 else 128 - rc
+    finally:
+        if not ticket.closed:
+            ticket.close()
+            (locks / Path(ticket.name).name).unlink(missing_ok=True)
+        for h in handles.values():
+            h.close()
+        try:
+            publish(total)
+        except OSError:
+            pass
+
+
+def main(argv):
+    STATE.mkdir(parents=True, exist_ok=True)
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0 if argv else 64
+    if argv[0] == "status":
+        total = total_slots()
+        publish(total)
+        print((STATE / "state.json").read_text())
+        return 0
+    if argv[0] == "rustc" and "--" in argv and argv[argv.index("--") + 1:]:
+        try:
+            return run_rustc(argv[argv.index("--") + 1:])
+        except OSError as exc:
+            print(f"compile-slot-gate: {exc}; command was not admitted", file=sys.stderr)
+            return 2
+    print("usage: compile-slot-gate rustc -- <command...> | status", file=sys.stderr)
+    return 64
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

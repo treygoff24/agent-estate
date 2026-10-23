@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Install estate-cleanup onto paths.bin and the six-hourly job. Idempotent; --dry-run changes nothing.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+
+if [ "$ESTATE_DRY_RUN" = 1 ]; then
+  if [ "$(readlink "$BIN/estate-cleanup" 2>/dev/null)" = "$ESTATE_MODULE_DIR/estate-cleanup" ]; then
+    echo "unchanged: $BIN/estate-cleanup" >&2
+  else
+    echo "would link: $BIN/estate-cleanup -> $ESTATE_MODULE_DIR/estate-cleanup" >&2
+  fi
+else
+  mkdir -p "$BIN"
+  ln -sfn "$ESTATE_MODULE_DIR/estate-cleanup" "$BIN/estate-cleanup"
+fi
+
+if [ "$ESTATE_PLATFORM" = mac ]; then
+  pin_python   # launchd's PATH has no python3 worth using; the job names its interpreter
+  [ "$ESTATE_DRY_RUN" = 1 ] || mkdir -p "$(dirname "$PLIST")"
+  changed=1
+  if [ -f "$PLIST" ] && rendered_pinned cleanup.plist | cmp -s - "$PLIST"; then
+    changed=0
+  fi
+  render_pinned cleanup.plist "$PLIST"
+  if [ "$changed" = 1 ] || ! launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    run launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    run launchctl bootstrap "$DOMAIN" "$PLIST"
+  fi
+else
+  [ "$ESTATE_DRY_RUN" = 1 ] || mkdir -p "$UNIT_DIR"
+  render cleanup.service "$SERVICE"
+  render cleanup.timer "$TIMER_FILE"
+  run systemctl --user daemon-reload
+  run systemctl --user enable --now "$TIMER"
+fi
+
+# First run now, so the check has a record to find. A dry run first would be: estate-cleanup run --dry-run.
+if [ "$ESTATE_DRY_RUN" = 1 ]; then
+  echo "would run: estate-cleanup run" >&2
+else
+  "${PY:-python3}" "$ESTATE_MODULE_DIR/estate-cleanup" run >/dev/null || true
+fi
+say "installed: cleanup every six hours (preview with: estate-cleanup run --dry-run)"

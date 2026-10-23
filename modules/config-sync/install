@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Install config-sync: the estate-config-sync command, the agent-env checkout (cloned from
+# `remote`, or created from the starter), then apply the manifest. Idempotent; --dry-run
+# changes nothing.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+
+link="$BIN/$TOOL_NAME"
+if [ -L "$link" ] && [ "$(readlink "$link")" = "$TOOL" ]; then
+  say "unchanged: $link"
+else
+  if [ "$ESTATE_DRY_RUN" = 1 ]; then
+    say "would link $link -> $TOOL"
+  else
+    mkdir -p "$BIN"
+    ln -sfn "$TOOL" "$link"
+    say "linked $link -> $TOOL"
+  fi
+fi
+
+# $ESTATE_DRY_RUN is already in the environment of every module script.
+dry=""
+[ "$ESTATE_DRY_RUN" = 1 ] && dry="--dry-run"
+# The guardrails hook fragments name footgun-hook as ~/.local/bin/footgun-hook; tell init where
+# it really is (in ~ form, so one file serves every machine).
+hook_bin="$BIN"
+# shellcheck disable=SC2088  # a literal ~ is the point: the repo file must work on every machine
+case "$BIN" in "$HOME"/*) hook_bin="~/${BIN#"$HOME"/}" ;; esac
+python3 "$TOOL" init --repo "$REPO" --remote "$REMOTE" --name "$(cfg user.name)" \
+  --email "$(cfg user.email)" --hook-bin "$hook_bin" ${dry:+"$dry"}
+python3 "$TOOL" apply --repo "$REPO" ${dry:+"$dry"}
+case ":$PATH:" in
+  *":$BIN:"*) ;;
+  *) say "note: $BIN is not on PATH here; the nightly hook should use the full path $link" ;;
+esac

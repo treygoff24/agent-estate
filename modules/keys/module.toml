@@ -1,0 +1,13 @@
+name = "keys"
+description = "Key hygiene: one 0600 key file of named provider keys, loaded fail-closed"
+platforms = ["mac", "linux"]
+requires = []
+
+[prerequisites]
+all = ["python3"]
+
+[defaults]
+shim_dir = "~/.local/bin/estate-shims"
+tools = {}
+optional = []
+remote_root = "Code/agent-estate"

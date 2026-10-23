@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Install estate-show onto paths.bin and the expiry timer. Idempotent; --dry-run changes nothing.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+if [ "$ESTATE_PLATFORM" = mac ]; then
+  say "nothing to install on macOS (this module is Linux only)"
+  exit 0
+fi
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+
+if [ "$ESTATE_DRY_RUN" = 1 ]; then
+  if [ "$(readlink "$BIN/estate-show" 2>/dev/null)" = "$ESTATE_MODULE_DIR/estate-show" ]; then
+    echo "unchanged: $BIN/estate-show" >&2
+  else
+    echo "would link: $BIN/estate-show -> $ESTATE_MODULE_DIR/estate-show" >&2
+  fi
+else
+  mkdir -p "$BIN" "$UNIT_DIR"
+  ln -sfn "$ESTATE_MODULE_DIR/estate-show" "$BIN/estate-show"
+fi
+render show-reap.service "$SERVICE"
+render show-reap.timer "$TIMER_FILE"
+run systemctl --user daemon-reload
+run systemctl --user enable --now "$TIMER"
+if [ -z "$(cfg tailnet)" ]; then
+  say "note: tailnet is empty in estate.toml; set it (and run tailscale up) before publishing"
+fi
+say "installed: estate-show PATH|PORT [--ttl 24h] publishes on your tailnet"

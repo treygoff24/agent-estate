@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""agent-estate nightly sync: repo table, then hooks. Standard library only.
+
+  estate-sync            run it (what the timer does)
+  estate-sync --status   summarise the last run: prints "ok|warn|fail: ..." and
+                         exits 0 / 2 / 1 (what `check` uses)
+
+Never resets, stashes or discards local work: a dirty or diverged checkout is
+reported and skipped. Exit 1 if any repo or hook failed.
+"""
+import fcntl
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+DEFER = 75  # an install command exits 75 to say "not now, retry next run"
+MAX_AGE = timedelta(hours=36)
+ROOT = Path(os.environ.get("ESTATE_ROOT") or Path(__file__).resolve().parents[2])
+ESTATE = ROOT / "bin" / "estate"
+
+
+def now():
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def cfg(key, default=None):
+    p = subprocess.run([str(ESTATE), "config", "get", key, "--json"],
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if p.returncode != 0:
+        if default is not None:
+            return default
+        sys.exit(f"estate-sync: cannot read config {key}: {p.stderr.strip()}")
+    return json.loads(p.stdout)
+
+
+def state_dir():
+    return Path(os.environ.get("ESTATE_STATE") or cfg("paths.state")) / "sync"
+
+
+# ---------------------------------------------------------------- status ---
+
+def summarize(sdir):
+    f = sdir / "status.json"
+    if not f.is_file():
+        return 1, f"no sync has run yet ({f} is missing)"
+    try:
+        st = json.loads(f.read_text())
+        finished = datetime.fromisoformat(st["finished"])
+    except (ValueError, KeyError, OSError):
+        return 1, f"{f} is unreadable"
+    age = datetime.now(timezone.utc) - finished
+    if not st.get("ok"):
+        bad = [n for n, r in st.get("repos", {}).items() if r["status"] == "failed"]
+        bad += [h["command"] for h in st.get("hooks", []) if h["status"] == "failed"]
+        return 1, "last sync failed: " + ", ".join(bad or ["see log"])
+    if age > MAX_AGE:
+        return 1, f"last sync finished {int(age.total_seconds() // 3600)}h ago (limit 36h)"
+    skipped = [f"{n} ({r['reason']})" for n, r in st.get("repos", {}).items()
+               if r["status"] == "skipped"]
+    if skipped:
+        return 2, "synced, but skipped: " + "; ".join(skipped)
+    return 0, f"last sync {int(age.total_seconds() // 3600)}h ago, {len(st.get('repos', {}))} repos current"
+
+
+def status_main():
+    code, msg = summarize(state_dir())
+    print(f"{('ok', 'fail', 'warn')[code]}: {msg}")
+    return code
+
+
+# ------------------------------------------------------------------ repos ---
+
+def git(path, *args, timeout=900):
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL, env=env, timeout=timeout)
+
+
+def parse_table(f, code_dir, remote_base):
+    rows = []
+    if not f.is_file():
+        return rows
+    for n, line in enumerate(f.read_text().splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        cols = line.split("\t") + ["", ""]
+        name, path, install = (c.strip() for c in cols[:3])
+        if not name:
+            continue
+        path = os.path.expanduser(path) if path and path != "-" else str(code_dir / name)
+        rows.append({"name": name, "path": path, "install": install,
+                     "remote": f"{remote_base}/{name}.git"})
+    return rows
+
+
+def run_install(row, before, after, sdir):
+    pending = sdir / "pending" / row["name"]
+    if not row["install"]:
+        return "ok", ""
+    env = dict(os.environ, ESTATE_SYNC_NAME=row["name"], ESTATE_SYNC_REPO=row["path"],
+               ESTATE_SYNC_BEFORE=before, ESTATE_SYNC_AFTER=after,
+               ESTATE_SYNC_PLATFORM=os.environ.get("ESTATE_PLATFORM", ""))
+    p = subprocess.run(["bash", "-c", row["install"]], cwd=row["path"], env=env,
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    log(p.stdout + p.stderr, end="")
+    if p.returncode == DEFER:
+        pending.parent.mkdir(parents=True, exist_ok=True)
+        pending.touch()
+        return "skipped", "install deferred (exit 75); retried next run"
+    if p.returncode != 0:
+        pending.parent.mkdir(parents=True, exist_ok=True)
+        pending.touch()
+        return "failed", f"install command exited {p.returncode}"
+    pending.unlink(missing_ok=True)
+    return "ok", ""
+
+
+def sync_repo(row, sdir):
+    path = Path(row["path"])
+    pending = (sdir / "pending" / row["name"]).exists()
+    if not path.exists():
+        p = subprocess.run(["git", "clone", "--quiet", row["remote"], str(path)],
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                           env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+        if p.returncode != 0:
+            return "failed", f"clone failed: {(p.stderr.strip().splitlines() or ['?'])[-1]}"
+        after = git(path, "rev-parse", "HEAD").stdout.strip()
+        s, why = run_install(row, "", after, sdir)
+        return s, why or "cloned"
+    if git(path, "rev-parse", "--git-dir").returncode != 0:
+        return "skipped", f"{path} exists but is not a git checkout"
+    if git(path, "status", "--porcelain", "--untracked-files=no").stdout.strip():
+        return "skipped", "uncommitted changes; left untouched"
+    if git(path, "symbolic-ref", "-q", "HEAD").returncode != 0:
+        return "skipped", "detached HEAD"
+    if git(path, "rev-parse", "--abbrev-ref", "@{u}").returncode != 0:
+        return "skipped", "no upstream branch"
+    f = git(path, "fetch", "--quiet")
+    if f.returncode != 0:
+        return "failed", f"fetch failed: {(f.stderr.strip().splitlines() or ['?'])[-1]}"
+    before = git(path, "rev-parse", "HEAD").stdout.strip()
+    up = git(path, "rev-parse", "@{u}").stdout.strip()
+    if before != up:
+        if git(path, "merge-base", "--is-ancestor", up, before).returncode == 0:
+            pass  # local is ahead; nothing to pull
+        elif git(path, "merge-base", "--is-ancestor", before, up).returncode != 0:
+            return "skipped", "diverged from upstream; needs a human"
+        else:
+            p = git(path, "pull", "--no-rebase", "--ff-only", "--quiet")
+            if p.returncode != 0:
+                return "failed", f"pull failed: {(p.stderr.strip().splitlines() or ['?'])[-1]}"
+    after = git(path, "rev-parse", "HEAD").stdout.strip()
+    if after != before or pending:
+        return run_install(row, before, after, sdir)
+    return "ok", "up to date"
+
+
+# ------------------------------------------------------------------- main ---
+
+_logf = None
+
+
+def log(msg, end="\n"):
+    sys.stdout.write(msg + end)
+    sys.stdout.flush()
+    if _logf:
+        _logf.write(msg + end)
+        _logf.flush()
+
+
+def main():
+    global _logf
+    if "--status" in sys.argv[1:]:
+        return status_main()
+    sdir = state_dir()
+    sdir.mkdir(parents=True, exist_ok=True)
+    lock = open(sdir / "lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("estate-sync: another run is in progress; exiting", file=sys.stderr)
+        return 0
+    _logf = open(sdir / "sync.log", "a")
+    result = {"started": now(), "repos": {}, "hooks": []}
+    log(f"== estate-sync {result['started']}")
+
+    code_dir = Path(os.path.expanduser(cfg("paths.code")))
+    remote_base = cfg("git.remote_base").rstrip("/")
+    table = Path(os.path.expanduser(cfg("modules.sync.repos_file")))
+    rows = parse_table(table, code_dir, remote_base)
+    for row in rows:
+        t0 = now()
+        try:
+            status, reason = sync_repo(row, sdir)
+        except Exception as e:  # one bad repo must not stop the rest
+            status, reason = "failed", f"{type(e).__name__}: {e}"
+        result["repos"][row["name"]] = {"status": status, "reason": reason,
+                                        "path": row["path"], "started": t0, "finished": now()}
+        log(f"repo {row['name']}: {status}" + (f" ({reason})" if reason else ""))
+
+    env = dict(os.environ, ESTATE_ROOT=str(ROOT), ESTATE_STATE=str(sdir.parent))
+    for command in cfg("modules.sync.hooks", default=[]):
+        t0 = now()
+        try:
+            p = subprocess.run(["bash", "-c", command], env=env, capture_output=True,
+                               text=True, stdin=subprocess.DEVNULL, timeout=3600)
+            log(p.stdout + p.stderr, end="")
+            status, reason = ("ok", "") if p.returncode == 0 else ("failed", f"exit {p.returncode}")
+        except subprocess.TimeoutExpired:
+            status, reason = "failed", "timed out after 1h"
+        result["hooks"].append({"command": command, "status": status, "reason": reason,
+                                "started": t0, "finished": now()})
+        log(f"hook {command}: {status}" + (f" ({reason})" if reason else ""))
+
+    result["finished"] = now()
+    bad = [r for r in result["repos"].values() if r["status"] == "failed"]
+    bad += [h for h in result["hooks"] if h["status"] == "failed"]
+    result["ok"] = not bad
+    tmp = sdir / ".status.json.tmp"
+    tmp.write_text(json.dumps(result, indent=2) + "\n")
+    os.replace(tmp, sdir / "status.json")
+    log(f"== done: {'ok' if result['ok'] else str(len(bad)) + ' failed'}")
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

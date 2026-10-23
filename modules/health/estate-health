@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""estate-health: a read-only collector. What is the state of this box now, and what
+happened since I last looked?
+
+    estate-health            collect, write the cache, print the report as text
+    estate-health --json     same, as JSON
+    estate-health show       print the cached report without collecting
+    estate-health ack        record that a human or agent triaged the report
+    estate-health --quiet    collect and write the cache only (what the timer runs)
+
+Exit code is the worst severity: 0 ok (or unknown), 1 warn, 2 crit; `show` exits 3
+when there is no cached report. `--quiet` always exits 0, so the timer unit itself
+does not fail. Nothing here kills, deletes, restarts or installs anything; the only
+writes are the files under $ESTATE_STATE/health/.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(os.environ.get("ESTATE_ROOT") or Path(__file__).resolve().parents[2])
+sys.path.insert(0, str(ROOT / "lib"))
+from estate import config as C  # noqa: E402
+from estate import modules as M  # noqa: E402
+
+RANK = {"unknown": 0, "ok": 0, "warn": 1, "crit": 2}
+ORDER = ["ok", "unknown", "warn", "crit"]
+CORE_FIELDS = ("id", "severity", "summary", "detail", "fix_hint")
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def check(cid, severity, summary, detail=None, fix=None):
+    return {"id": cid, "severity": severity, "summary": summary,
+            "detail": detail or {}, "fix_hint": fix}
+
+
+def grade(value, warn, crit):
+    return "crit" if value >= crit else "warn" if value >= warn else "ok"
+
+
+def run(cmd, timeout=20):
+    """Run a read-only command; (returncode, stdout) or (None, reason) if it cannot run."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+        return p.returncode, p.stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, str(e)
+
+
+def load():
+    cfg = C.load(None, M.discover())
+    return cfg, cfg["modules"]["health"], C.current_platform()
+
+
+# ---- checks ---------------------------------------------------------------
+
+def check_disk(cfg, s):
+    try:
+        u = shutil.disk_usage(Path.home())
+    except OSError as e:
+        return check("disk", "unknown", f"cannot read disk usage: {e}")
+    pct = round(100 * u.used / u.total, 1)
+    sev = grade(pct, float(s["disk_warn"]), float(s["disk_crit"]))
+    return check("disk", sev, f"home volume {pct}% used, {u.free // 2**30} GiB free",
+                 {"used_pct": pct, "free_bytes": u.free},
+                 None if sev == "ok" else
+                 "run estate-cleanup run, then look for build caches (target/, node_modules) "
+                 "and old worktrees; ask before deleting anything else")
+
+
+def mem_used_pct(platform):
+    if platform == "linux":
+        meminfo = Path(os.environ.get("ESTATE_HEALTH_PROC", "/proc")) / "meminfo"
+        vals = {}
+        for line in meminfo.read_text().splitlines():
+            k, _, v = line.partition(":")
+            vals[k] = int(v.split()[0])
+        return 100 * (1 - vals["MemAvailable"] / vals["MemTotal"])
+    rc, out = run(["vm_stat"])
+    rc2, total = run(["sysctl", "-n", "hw.memsize"])
+    if rc != 0 or rc2 != 0:
+        raise OSError("vm_stat/sysctl unavailable")
+    page = int(re.search(r"page size of (\d+)", out).group(1))
+    # Skip the "Mach Virtual Memory Statistics: (page size ...)" header and any
+    # other line whose value is not a page count.
+    pages = {}
+    for ln in out.splitlines():
+        k, _, v = ln.partition(":")
+        v = v.strip().rstrip(".")
+        if v.isdigit():
+            pages[k.strip()] = int(v)
+    avail = sum(pages.get(k, 0) for k in
+                ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"))
+    return 100 * (1 - avail * page / int(total))
+
+
+def check_memory(cfg, s, platform):
+    try:
+        pct = round(mem_used_pct(platform), 1)
+    except (OSError, KeyError, ValueError, AttributeError) as e:
+        return check("memory", "unknown", f"cannot read memory usage: {e}")
+    sev = grade(pct, float(s["mem_warn"]), float(s["mem_crit"]))
+    return check("memory", sev, f"{pct}% of memory in use", {"used_pct": pct},
+                 None if sev == "ok" else "see the runaway_processes check for the likely cause")
+
+
+def check_units(cfg, platform):
+    prefix = cfg["label_prefix"]
+    if platform == "linux":
+        rc, out = run(["systemctl", "--user", "list-units", "--failed", "--plain",
+                       "--no-legend", "--no-pager"])
+        if rc is None:
+            return check("units", "unknown", f"systemctl unavailable: {out}")
+        failed = [ln.split()[0] for ln in out.splitlines()
+                  if ln.split() and ln.split()[0].startswith(prefix)]
+        hint = ("journalctl --user -u <unit> -n 30; fix the cause, then "
+                "systemctl --user reset-failed <unit>")
+        noun = "user unit"
+    else:
+        rc, out = run(["launchctl", "list"])
+        if rc is None:
+            return check("units", "unknown", f"launchctl unavailable: {out}")
+        failed = []
+        for ln in out.splitlines():
+            cols = ln.split("\t")
+            if len(cols) == 3 and cols[2].startswith(prefix) and cols[1] not in ("0", "-"):
+                failed.append(f"{cols[2]} (exit {cols[1]})")
+        hint = "read the agent's log under the state directory, fix, then re-run estate install"
+        noun = "launchd agent"
+    if not failed:
+        return check("units", "ok", f"no failed {noun}s with prefix {prefix}")
+    return check("units", "warn", f"{len(failed)} failed {noun}(s): " + ", ".join(failed),
+                 {"failed": failed}, hint)
+
+
+def check_doctor():
+    rc, out = run([str(ROOT / "bin" / "estate"), "doctor", "--json"], timeout=50)
+    if rc is None:
+        return check("doctor", "unknown", f"could not run estate doctor: {out}")
+    try:
+        rows = json.loads(out)["checks"]
+    except (ValueError, KeyError):
+        return check("doctor", "crit", "estate doctor gave unreadable output",
+                     {"exit": rc}, "run: estate doctor")
+    bad = [r for r in rows if r["status"] != 0]
+    if not bad:
+        return check("doctor", "ok", f"estate doctor: all {len(rows)} checks ok")
+    failed = [r["name"] for r in bad if r["status"] == 1]
+    warned = [r["name"] for r in bad if r["status"] != 1]
+    sev = "crit" if failed else "warn"
+    parts = ([f"failing: {', '.join(failed)}"] if failed else []) + \
+            ([f"warning: {', '.join(warned)}"] if warned else [])
+    return check("doctor", sev, "estate doctor " + "; ".join(parts),
+                 {"failed": failed, "warned": warned,
+                  "rows": [{"name": r["name"], "summary": r["summary"],
+                            "done_when": r["done_when"]} for r in bad]},
+                 "run: estate doctor, and follow each row's 'done when'")
+
+
+def check_sync(cfg):
+    """Ask the sync module itself: `estate-sync --status` prints ok|warn|fail and exits 0/2/1."""
+    state = Path(cfg["paths"]["state"])
+    tool = Path(__file__).resolve().parents[2] / "modules" / "sync" / "estate-sync"
+    if not tool.is_file() or not (state / "sync").is_dir():
+        return check("sync", "unknown", "no sync state yet (sync module not installed or never ran)")
+    try:
+        p = subprocess.run([sys.executable, str(tool), "--status"], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=60,
+                           env=dict(os.environ, ESTATE_STATE=str(state)))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return check("sync", "unknown", f"estate-sync --status did not run: {e}")
+    line = (p.stdout.strip().splitlines() or ["no output from estate-sync --status"])[0]
+    summary = re.sub(r"^(ok|warn|fail):\s*", "", line)
+    if p.returncode == 0:
+        return check("sync", "ok", summary)
+    return check("sync", "warn", summary, {"status_exit": p.returncode},
+                 "read sync.log under the state directory's sync/ folder; fix, then run estate-sync")
+
+
+def etime_s(s):
+    """ps etime [[dd-]hh:]mm:ss -> seconds."""
+    days, _, rest = s.rpartition("-")
+    parts = [int(x) for x in rest.split(":")]
+    secs = 0
+    for p in parts:
+        secs = secs * 60 + p
+    return secs + (int(days) * 86400 if days else 0)
+
+
+def check_runaway(cfg, s):
+    rc, out = run(["ps", "-axo", "pid=,etime=,pcpu=,comm="])
+    if rc is None or rc != 0:
+        return check("runaway_processes", "unknown", "ps unavailable")
+    min_s = int(s["runaway_minutes"]) * 60
+    min_cpu = float(s["runaway_cpu"])
+    hot = []
+    for ln in out.splitlines():
+        f = ln.split(None, 3)
+        try:
+            pid, et, cpu, comm = int(f[0]), etime_s(f[1]), float(f[2]), f[3]
+        except (IndexError, ValueError):
+            continue
+        if pid != os.getpid() and et >= min_s and cpu >= min_cpu:
+            hot.append({"pid": pid, "cpu_pct": cpu, "age_min": et // 60,
+                        "command": os.path.basename(comm)})
+    if not hot:
+        return check("runaway_processes", "ok",
+                     f"no process averaging over {min_cpu:g}% CPU for {s['runaway_minutes']}+ min")
+    hot.sort(key=lambda h: -h["cpu_pct"])
+    names = ", ".join(f"{h['command']}({h['pid']})" for h in hot[:5])
+    return check("runaway_processes", "warn", f"{len(hot)} long-running high-CPU process(es): {names}",
+                 {"processes": hot[:20]},
+                 "a build or an active agent is fine; a process with no live owner is not. "
+                 "Show the owner and propose a kill to the human; do not kill it yourself")
+
+
+def check_worktrees(cfg, s):
+    code = Path(cfg["paths"]["code"])
+    if not code.is_dir():
+        return check("stale_worktrees", "unknown", f"{code} does not exist")
+    cutoff = time.time() - int(s["worktree_days"]) * 86400
+    stale = []
+    for repo in sorted(p for p in code.iterdir() if (p / ".git").is_dir()):
+        rc, out = run(["git", "-C", str(repo), "worktree", "list", "--porcelain"])
+        if rc != 0:
+            continue
+        paths = [ln[9:] for ln in out.splitlines() if ln.startswith("worktree ")][1:]
+        for wt in paths:
+            wp = Path(wt)
+            if not wp.exists():
+                stale.append({"path": wt, "reason": "directory missing (prunable)"})
+                continue
+            rc, gd = run(["git", "-C", wt, "rev-parse", "--absolute-git-dir"])
+            if rc != 0:
+                continue
+            marks = [Path(gd.strip()) / n for n in ("HEAD", "index", "logs/HEAD")]
+            newest = max([m.stat().st_mtime for m in marks if m.exists()] or [0])
+            if newest < cutoff:
+                stale.append({"path": wt, "reason": f"untouched for over {s['worktree_days']} days"})
+    if not stale:
+        return check("stale_worktrees", "ok", "no stale git worktrees")
+    return check("stale_worktrees", "warn", f"{len(stale)} stale git worktree(s)",
+                 {"worktrees": stale[:20]},
+                 "estate-cleanup removes clean ones past its age; for a dirty one, ask "
+                 "whether its work was kept before removing it")
+
+
+def collect(cfg, s, platform):
+    checks = [check_disk(cfg, s), check_memory(cfg, s, platform), check_units(cfg, platform),
+              check_doctor(), check_sync(cfg), check_runaway(cfg, s), check_worktrees(cfg, s)]
+    return checks
+
+
+# ---- state, ack, report ---------------------------------------------------
+
+def health_dir(cfg):
+    d = Path(cfg["paths"]["state"]) / "health"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def read_json(p, default):
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(p, doc):
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(doc, indent=2) + "\n")
+    os.replace(tmp, p)
+
+
+def worst(checks):
+    return max((c["severity"] for c in checks), key=lambda s: ORDER.index(s))
+
+
+def cleanup_events_since(cfg, since_ts):
+    """Counts of the cleanup module's JSONL events newer than since_ts (epoch seconds)."""
+    d = Path(cfg["paths"]["state"]) / "cleanup"
+    counts, freed = {}, 0
+    for f in sorted(d.glob("events-*.jsonl")) if d.is_dir() else []:
+        if f.stat().st_mtime < since_ts:
+            continue
+        for ln in f.read_text().splitlines():
+            try:
+                ev = json.loads(ln)
+            except ValueError:
+                continue
+            if ev.get("epoch", 0) >= since_ts:
+                counts[ev.get("kind", "?")] = counts.get(ev.get("kind", "?"), 0) + 1
+                if ev.get("kind") == "deleted":
+                    freed += int(ev.get("bytes", 0))
+    return {"counts": counts, "bytes_freed": freed}
+
+
+def build_report(cfg, s, platform):
+    checks = collect(cfg, s, platform)
+    ack = read_json(health_dir(cfg) / "ack.json", {})
+    known = ack.get("known", {})
+    bad = {c["id"]: c["severity"] for c in checks if RANK[c["severity"]] > 0}
+    new = sorted(i for i, sev in bad.items() if i not in known or
+                 (sev == "crit" and known[i] != "crit"))
+    resolved = sorted(i for i in known if i not in bad)
+    since = ack.get("epoch", 0)
+    sev = worst(checks)
+    return {
+        "version": 1,
+        "generated_at": now_iso(),
+        "epoch": int(time.time()),
+        "platform": platform,
+        "machine": os.environ.get("ESTATE_MACHINE") or (
+            (C.this_machine(cfg, platform) or {}).get("name", "")),
+        "severity": sev,
+        "attention": bool(new) or any(v == "crit" for v in bad.values()),
+        "checks": checks,
+        "since_ack": {"acked_at": ack.get("acked_at"), "acked_by": ack.get("by"),
+                      "new": new, "resolved": resolved,
+                      "cleanup": cleanup_events_since(cfg, since)},
+    }
+
+
+def render_text(r):
+    mark = {"ok": " ok ", "unknown": " ?  ", "warn": "warn", "crit": "CRIT"}
+    out = [f"estate-health {r['generated_at']} {r['machine'] or r['platform']}: "
+           f"{r['severity'].upper()}" + ("  (needs attention)" if r["attention"] else "")]
+    for c in r["checks"]:
+        out.append(f"[{mark[c['severity']]}] {c['id']}: {c['summary']}")
+        if c["severity"] in ("warn", "crit") and c["fix_hint"]:
+            out.append(f"         fix: {c['fix_hint']}")
+    sa = r["since_ack"]
+    out.append("")
+    out.append(f"since last ack ({sa['acked_at'] or 'never acked'}):")
+    out.append("  new: " + (", ".join(sa["new"]) or "nothing"))
+    if sa["resolved"]:
+        out.append("  resolved: " + ", ".join(sa["resolved"]))
+    cl = sa["cleanup"]
+    if cl["counts"]:
+        out.append("  cleanup: " + ", ".join(f"{n} {k}" for k, n in sorted(cl["counts"].items()))
+                   + f", {cl['bytes_freed'] // 2**20} MiB freed")
+    return "\n".join(out)
+
+
+def emit(r, as_json):
+    print(json.dumps(r, indent=2) if as_json else render_text(r))
+    return RANK[r["severity"]]
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="estate-health", description=__doc__.split("\n\n")[0])
+    ap.add_argument("action", nargs="?", choices=["show", "ack"])
+    ap.add_argument("--json", action="store_true", help="print the report as JSON")
+    ap.add_argument("--quiet", action="store_true", help="collect and cache only; always exit 0")
+    ap.add_argument("--no-write", action="store_true", help="do not update the cache")
+    ap.add_argument("--by", default="", help="with ack: who triaged (a name, free text)")
+    args = ap.parse_args()
+    try:
+        cfg, s, platform = load()
+    except (C.ConfigError, M.ModuleError, ValueError, KeyError) as e:
+        print(f"estate-health: {e}", file=sys.stderr)
+        return 2
+    cache = health_dir(cfg) / "latest.json"
+    if args.action == "show":
+        r = read_json(cache, None)
+        if r is None:
+            print("estate-health: no cached report; run estate-health", file=sys.stderr)
+            return 3
+        return emit(r, args.json)
+    if args.action == "ack":
+        # Acknowledge exactly what was just read: the cached report if there is one,
+        # else a fresh collection. Known findings stop being "new" until they clear.
+        r = read_json(cache, None) or build_report(cfg, s, platform)
+        known = {c["id"]: c["severity"] for c in r["checks"] if RANK[c["severity"]] > 0}
+        write_json(health_dir(cfg) / "ack.json",
+                   {"acked_at": now_iso(), "epoch": int(time.time()), "by": args.by or None,
+                    "known": known})
+        r = build_report(cfg, s, platform)
+        write_json(cache, r)
+        print(f"acked {len(known)} finding(s); next report starts from here")
+        return 0
+    r = build_report(cfg, s, platform)
+    if not args.no_write:
+        write_json(cache, r)
+    if args.quiet:
+        return 0
+    return emit(r, args.json)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

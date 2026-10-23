@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Daily restic backup, run by the systemd user timer. Reads RESTIC_REPOSITORY,
+# RESTIC_PASSWORD and the repository's access keys from the environment (the
+# unit loads them from the key file). Never prints them.
+set -euo pipefail
+: "${RESTIC_REPOSITORY:?RESTIC_REPOSITORY is not set (modules.baseline.backup_repo)}"
+: "${RESTIC_PASSWORD:?RESTIC_PASSWORD is not in the key file}"
+paths="${BASELINE_BACKUP_PATHS:-}"
+[ -n "$paths" ] || paths="$HOME"
+state="${ESTATE_STATE:-$HOME/.local/state/agent-estate}/baseline"
+mkdir -p "$state"
+
+if ! restic cat config >/dev/null 2>&1; then
+  restic init
+fi
+# $paths is deliberately split: space-separated absolute paths.
+# shellcheck disable=SC2086
+restic backup --retry-lock 20m --tag estate --exclude-caches \
+  --exclude '**/node_modules' --exclude '**/.venv' --exclude "$HOME/.cache" \
+  --exclude '**/target/debug' --exclude '**/target/release' $paths
+# forget only; the weekly restic-maintain does the prune
+restic forget --retry-lock 20m --tag estate \
+  --keep-daily "${BASELINE_KEEP_DAILY:-14}" --keep-weekly "${BASELINE_KEEP_WEEKLY:-8}" \
+  --keep-monthly "${BASELINE_KEEP_MONTHLY:-12}"
+date +%s > "$state/last-backup"

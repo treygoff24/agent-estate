@@ -1,0 +1,10 @@
+# Rendered by agent-estate (${label}) from estate.toml; do not edit here.
+[Unit]
+Description=take down expired estate-show links
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${modules.show.reap_minutes}min
+
+[Install]
+WantedBy=timers.target

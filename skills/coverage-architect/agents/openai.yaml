@@ -1,0 +1,4 @@
+interface:
+  display_name: "Coverage Architect"
+  short_description: "Behavior-first test coverage workflow"
+  default_prompt: "Use $coverage-architect to assess this repo's test maturity, delegate high-value test implementation, and review the resulting tests for behavior-focused quality."

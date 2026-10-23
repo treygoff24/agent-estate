@@ -1,0 +1,14 @@
+name = "usage"
+description = "Poll Claude and Codex subscription usage into a JSON snapshot; `usage-show` prints it"
+platforms = ["mac", "linux"]
+requires = []
+
+[prerequisites]
+all = ["python3"]
+linux = ["systemctl"]
+mac = ["launchctl"]
+
+# Every setting this module reads. Override in estate.toml under [modules.usage].
+[defaults]
+interval_seconds = 600   # how often the timer polls; 300 or more is polite
+refresh_login = false    # opt in to refreshing an EXPIRED Claude login file (never a keychain item); see README

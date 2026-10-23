@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+"""estate-show: hand someone a link. Publish a file, a directory, or a live local dev
+port over your tailnet (Tailscale Serve, tailnet-only, never Funnel), with a time limit.
+
+    estate-show PATH [--name N] [--ttl 24h]      copy PATH to a disposable page and publish it
+    estate-show PORT [--name N] [--ttl 24h]      expose http://127.0.0.1:PORT (does not start it)
+    estate-show ls                               what is published, and when it expires
+    estate-show rm NAME                          take one down now
+    estate-show reap                             take down everything past its TTL (the timer runs this)
+
+Flags for every command: --json (versioned envelope; errors go to stderr as JSON),
+--dry-run (say what would happen, change nothing). An existing path beats the
+digits-mean-a-port shorthand; use the explicit `publish` / `port` verbs to disambiguate.
+Exit codes: 0 ok, 2 bad input, 3 Tailscale unavailable or refused, 4 other failure.
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(os.environ.get("ESTATE_ROOT") or Path(__file__).resolve().parents[2])
+sys.path.insert(0, str(ROOT / "lib"))
+from estate import config as C  # noqa: E402
+from estate import modules as M  # noqa: E402
+
+VERBS = {"publish", "port", "ls", "rm", "reap", "help"}
+PAGES_PORT = 8443
+PORT_RANGE = range(8450, 8500)
+MAX_TTL = 30 * 86400
+SIZES = {"": 1, "b": 1, "kb": 1000, "mb": 1_000_000, "gb": 1_000_000_000}
+TTLS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+class ShowError(Exception):
+    def __init__(self, code, message, hint=""):
+        super().__init__(message)
+        self.code, self.message, self.hint = code, message, hint
+
+
+def bad(message, hint=""):
+    return ShowError(2, message, hint)
+
+
+def parse_ttl(text):
+    m = re.fullmatch(r"(\d+)([smhd])", str(text).lower())
+    if not m or int(m.group(1)) == 0:
+        raise bad(f"bad --ttl {text!r}", "use a positive number and s, m, h or d: 90m, 24h, 7d")
+    secs = int(m.group(1)) * TTLS[m.group(2)]
+    if secs > MAX_TTL:
+        raise bad("--ttl is capped at 30d", "use --ttl 30d or less")
+    return secs
+
+
+def parse_size(text):
+    m = re.fullmatch(r"(\d+)(b|kb|mb|gb)?", str(text).lower())
+    if not m or int(m.group(1)) == 0:
+        raise bad(f"bad --max-size {text!r}", "use bytes or B, KB, MB, GB: 500MB")
+    return int(m.group(1)) * SIZES[m.group(2) or ""]
+
+
+def slug(text):
+    out = re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-")
+    if not out or len(out) > 128:
+        raise bad(f"bad name {text!r}", "a name is 1-128 letters, digits and hyphens")
+    return out
+
+
+def human_left(secs):
+    secs = int(secs)
+    if secs <= 0:
+        return "expired"
+    secs = -(-secs // 60) * 60   # round up to the minute: a 7d link reads 7d, not 6d
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= n:
+            return f"{secs // n}{unit}"
+    return f"{secs}s"
+
+
+def tree_bytes(p):
+    p = Path(p)
+    if p.is_file():
+        return p.stat().st_size
+    total = 0
+    for dirpath, _, files in os.walk(p, followlinks=False):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _inside(real, root):
+    return real == root or real.startswith(root + os.sep)
+
+
+def symlinks_of(tree):
+    """Every symlink under tree (not following any), as paths."""
+    for dirpath, dirnames, files in os.walk(tree, followlinks=False):
+        for n in dirnames + files:
+            p = os.path.join(dirpath, n)
+            if os.path.islink(p):
+                yield p
+
+
+def check_tree_links(src):
+    """Refuse a directory holding a symlink that resolves outside it: the published copy would
+    expose whatever it points at."""
+    root = os.path.realpath(src)
+    for link in symlinks_of(src):
+        real = os.path.realpath(link)
+        if not _inside(real, root):
+            rel = os.path.relpath(link, src)
+            raise bad(f"{rel} is a symlink that resolves outside {Path(src).name} ({real}); "
+                      "refusing to publish it",
+                      "remove the link or replace it with a real copy, then publish again")
+
+
+def copy_tree(src, staged):
+    """Copy src into staged keeping internal symlinks, retargeted relative to the copy so they
+    never point back at the source tree. Verifies containment after the copy."""
+    shutil.copytree(src, staged, symlinks=True, dirs_exist_ok=True)
+    src_root, out_root = os.path.realpath(src), os.path.realpath(staged)
+    for link in list(symlinks_of(staged)):
+        rel = os.path.relpath(link, staged)
+        real = os.path.realpath(os.path.join(src, rel))
+        if not _inside(real, src_root):
+            raise bad(f"{rel} is a symlink that resolves outside the published tree; refusing")
+        target = os.path.join(out_root, os.path.relpath(real, src_root))
+        os.unlink(link)
+        os.symlink(os.path.relpath(target, os.path.dirname(os.path.join(out_root, rel))), link)
+    for link in symlinks_of(staged):
+        if not _inside(os.path.realpath(link), out_root):
+            raise bad(f"{os.path.relpath(link, staged)} resolves outside the copy; refusing")
+
+
+# ---- tailscale ------------------------------------------------------------
+
+def ts(*args, check=True):
+    try:
+        p = subprocess.run(["tailscale", *args], capture_output=True, text=True, timeout=30,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise ShowError(3, f"tailscale {' '.join(args)}: {e}",
+                        "install and start Tailscale, then run: estate doctor") from None
+    if check and p.returncode != 0:
+        denied = re.search(r"denied|operator", p.stderr, re.I)
+        raise ShowError(3, f"tailscale {' '.join(args)}: {p.stderr.strip() or p.stdout.strip()}",
+                        "an admin runs once: sudo tailscale set --operator=$USER"
+                        if denied else "check `tailscale status`")
+    return p
+
+
+def tailnet_host(cfg):
+    p = ts("status", "--json")
+    try:
+        st = json.loads(p.stdout)
+    except ValueError:
+        raise ShowError(3, "tailscale status gave unreadable output", "check `tailscale status`") from None
+    if st.get("BackendState") != "Running":
+        raise ShowError(3, f"Tailscale is {st.get('BackendState', 'not running')}",
+                        "run `tailscale up`, then retry")
+    host = (st.get("Self") or {}).get("DNSName", "").rstrip(".")
+    if not host and cfg.get("tailnet"):
+        host = f"{(st.get('Self') or {}).get('HostName', socket.gethostname())}.{cfg['tailnet']}"
+    if not host:
+        raise ShowError(3, "this machine has no tailnet DNS name", "enable MagicDNS and HTTPS in the Tailscale admin console")
+    return host
+
+
+def serve_ports_in_use():
+    p = ts("serve", "status", "--json", check=False)
+    try:
+        return {int(k) for k in (json.loads(p.stdout or "{}").get("TCP") or {})}
+    except ValueError:
+        return set()
+
+
+# ---- state ----------------------------------------------------------------
+
+class Store:
+    def __init__(self, cfg, dry):
+        self.dir = Path(cfg["paths"]["state"]) / "show"
+        self.pages = self.dir / "pages"
+        self.file = self.dir / "state.json"
+        self.dry = dry
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._lock = open(self.dir / "lock", "a")
+        fcntl.flock(self._lock, fcntl.LOCK_EX)
+        try:
+            self.entries = json.loads(self.file.read_text())["entries"]
+        except (OSError, ValueError, KeyError):
+            self.entries = []
+
+    def save(self):
+        if self.dry:
+            return
+        tmp = self.file.with_name("state.json.tmp")
+        tmp.write_text(json.dumps({"version": 1, "entries": self.entries}, indent=2) + "\n")
+        os.replace(tmp, self.file)
+
+    def find(self, name):
+        return next((e for e in self.entries if e["name"] == name), None)
+
+
+def view(e, now):
+    left = e["expires"] - now
+    return {k: e[k] for k in ("name", "kind", "url", "source", "created", "expires", "ttl")} | {
+        "expires_in": human_left(left), "expired": left <= 0}
+
+
+def unpublish(store, e):
+    """Take one entry down. Raises (state untouched) if Tailscale refuses."""
+    if store.dry:
+        return
+    if e["kind"] == "page":
+        ts("serve", f"--https={PAGES_PORT}", f"--set-path=/{e['name']}", "off")
+        shutil.rmtree(store.pages / e["name"], ignore_errors=True)
+    else:
+        ts("serve", f"--https={e['serve_port']}", "off")
+    store.entries.remove(e)
+    store.save()
+
+
+def reap(store, now):
+    gone, failed = [], []
+    for e in list(store.entries):
+        if e["expires"] <= now:
+            try:
+                unpublish(store, e)
+                gone.append(e["name"])
+            except ShowError as err:
+                failed.append({"name": e["name"], "error": err.message})
+    return gone, failed
+
+
+# ---- commands -------------------------------------------------------------
+
+def cmd_publish(a, cfg, store, now):
+    src = Path(a.path).expanduser()
+    if not (src.exists() or src.is_symlink()):
+        raise bad(f"no such path: {a.path}")
+    src = src.resolve()
+    ttl, limit = parse_ttl(a.ttl), parse_size(a.max_size)
+    name = slug(a.name or src.stem or src.name)
+    if src.is_dir():
+        check_tree_links(src)
+    size = tree_bytes(src)
+    if size > limit:
+        raise bad(f"{src.name} is {size} bytes, over --max-size {a.max_size}",
+                  "publish a smaller directory (a build output, not a repo), or raise --max-size")
+    host = tailnet_host(cfg)
+    leaf = src.name if src.is_file() else ""
+    url = f"https://{host}:{PAGES_PORT}/{name}/{leaf}"
+    entry = {"kind": "page", "name": name, "source": str(src), "created": int(now), "ttl": ttl,
+             "expires": int(now) + ttl, "local_port": None, "serve_port": PAGES_PORT, "url": url,
+             "size_bytes": size}
+    if a.dry_run:
+        return {"dry_run": True, "would_publish": view(entry, now)}
+    staged = store.pages / f".{name}.new"
+    shutil.rmtree(staged, ignore_errors=True)
+    staged.mkdir(parents=True)
+    if src.is_dir():
+        try:
+            copy_tree(src, staged)
+        except (ShowError, OSError):
+            shutil.rmtree(staged, ignore_errors=True)
+            raise
+    else:
+        shutil.copy2(src, staged / src.name)
+    old = store.find(name)
+    if old and old["kind"] != "page":
+        # Replacing a port publication: turn its Serve port off first, as cmd_port does for a
+        # page. If Tailscale refuses, the old entry stays tracked (reap and rm can retry).
+        try:
+            unpublish(store, old)
+        except ShowError:
+            shutil.rmtree(staged, ignore_errors=True)
+            raise
+    dest = store.pages / name
+    shutil.rmtree(dest, ignore_errors=True)
+    os.replace(staged, dest)
+    try:
+        ts("serve", "--bg", f"--https={PAGES_PORT}", f"--set-path=/{name}", str(dest))
+    except ShowError:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+    store.entries = [e for e in store.entries if e["name"] != name] + [entry]
+    store.save()
+    return {"published": view(entry, now)}
+
+
+def cmd_port(a, cfg, store, now):
+    ttl = parse_ttl(a.ttl)
+    port = int(a.port)
+    if not 1 <= port <= 65535:
+        raise bad(f"bad port {a.port}", "ports are 1-65535")
+    name = slug(a.name or f"port-{port}")
+    host = tailnet_host(cfg)
+    used = serve_ports_in_use() | {e["serve_port"] for e in store.entries if e["name"] != name}
+    old = store.find(name)
+    if old and old["kind"] == "port":
+        used.discard(old["serve_port"])
+    free = next((p for p in PORT_RANGE if p not in used), None)
+    if free is None:
+        raise ShowError(4, "no free publish port left", "estate-show ls, then estate-show rm <name>")
+    entry = {"kind": "port", "name": name, "source": f"127.0.0.1:{port}", "created": int(now),
+             "ttl": ttl, "expires": int(now) + ttl, "local_port": port, "serve_port": free,
+             "url": f"https://{host}:{free}/"}
+    warnings = []
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=2).close()
+    except OSError:
+        warnings.append(f"nothing is listening on 127.0.0.1:{port} yet; the link will 502 until it is")
+    if a.dry_run:
+        return {"dry_run": True, "would_publish": view(entry, now), "warnings": warnings}
+    if old:
+        unpublish(store, old)
+    ts("serve", "--bg", f"--https={free}", f"http://127.0.0.1:{port}")
+    store.entries.append(entry)
+    store.save()
+    return {"published": view(entry, now), "warnings": warnings}
+
+
+def cmd_ls(a, cfg, store, now):
+    return {"entries": [view(e, now) for e in store.entries]}
+
+
+def cmd_rm(a, cfg, store, now):
+    name = slug(a.name)
+    e = store.find(name)
+    if not e:
+        raise bad(f"nothing published as {name!r}", "estate-show ls")
+    if a.dry_run:
+        return {"dry_run": True, "would_remove": name}
+    unpublish(store, e)
+    return {"removed": name}
+
+
+def cmd_reap(a, cfg, store, now):
+    if a.dry_run:
+        return {"dry_run": True, "would_reap": [e["name"] for e in store.entries if e["expires"] <= now]}
+    gone, failed = reap(store, now)
+    if failed:
+        raise ShowError(3, "could not take down: " + "; ".join(f"{f['name']} ({f['error']})" for f in failed),
+                        "fix Tailscale; the next reap retries")
+    return {"reaped": gone}
+
+
+def text_out(cmd, d):
+    if "entries" in d:
+        if not d["entries"]:
+            return "nothing published"
+        return "\n".join(f"{e['name']:20} {e['kind']:5} {e['expires_in']:>8}  {e['url']}"
+                         for e in d["entries"])
+    p = d.get("published") or d.get("would_publish")
+    if p:
+        out = [("would publish " if d.get("dry_run") else "") + f"{p['url']}  (expires in {p['expires_in']})"]
+        return "\n".join(out + [f"warning: {w}" for w in d.get("warnings", [])])
+    if "removed" in d or "would_remove" in d:
+        return ("would remove " if d.get("dry_run") else "removed ") + (d.get("removed") or d["would_remove"])
+    gone = d.get("reaped", d.get("would_reap", []))
+    return f"{'would reap' if d.get('dry_run') else 'reaped'}: {', '.join(gone) or 'nothing expired'}"
+
+
+def preprocess(argv):
+    """Sugar: an existing path means publish, digits mean port; verbs win otherwise."""
+    flags = {"--json", "--dry-run"}
+    for i, a in enumerate(argv):
+        if a in flags:
+            continue
+        if a.startswith("-") or a in VERBS:
+            break
+        if os.path.lexists(a):
+            return argv[:i] + ["publish"] + argv[i:]
+        if a.isdigit():
+            return argv[:i] + ["port"] + argv[i:]
+        break
+    return argv
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="estate-show", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=__doc__.split("\n\n", 1)[1])
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="versioned JSON envelope")
+    common.add_argument("--dry-run", action="store_true", help="change nothing, say what would happen")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("publish", parents=[common], help="publish a file or directory")
+    p.add_argument("path")
+    p.add_argument("--name")
+    p.add_argument("--ttl", default="24h")
+    p.add_argument("--max-size", default="500MB")
+    p.set_defaults(fn=cmd_publish)
+    p = sub.add_parser("port", parents=[common], help="expose a local dev port")
+    p.add_argument("port", type=int)
+    p.add_argument("--name")
+    p.add_argument("--ttl", default="24h")
+    p.set_defaults(fn=cmd_port)
+    sub.add_parser("ls", parents=[common], help="list published things").set_defaults(fn=cmd_ls)
+    p = sub.add_parser("rm", parents=[common], help="take one down now")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_rm)
+    sub.add_parser("reap", parents=[common], help="take down everything past its TTL").set_defaults(fn=cmd_reap)
+    args = ap.parse_args(preprocess(argv))
+    as_json = getattr(args, "json", False)
+    try:
+        try:
+            cfg = C.load(None, M.discover())
+        except (C.ConfigError, M.ModuleError) as e:
+            raise ShowError(4, str(e)) from None
+        store = Store(cfg, getattr(args, "dry_run", False))
+        now = time.time()
+        if args.cmd != "reap" and not store.dry:
+            reap(store, now)   # housekeeping: expired entries never linger past the next command
+        result = args.fn(args, cfg, store, now)
+        if as_json:
+            print(json.dumps({"version": 1, "ok": True, "command": args.cmd, "data": result}, indent=2))
+        else:
+            print(text_out(args.cmd, result))
+        return 0
+    except ShowError as e:
+        if as_json:
+            print(json.dumps({"version": 1, "ok": False, "error": {
+                "code": e.code, "message": e.message, "hint": e.hint}}), file=sys.stderr)
+        else:
+            print(f"estate-show: {e.message}" + (f"\n  hint: {e.hint}" if e.hint else ""), file=sys.stderr)
+        return e.code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

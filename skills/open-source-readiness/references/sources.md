@@ -1,0 +1,117 @@
+# Sources
+
+Primary sources the research lane used, fetched 2026-10 for the original pass. Refetch before relying on a page that gates a decision: GitHub's pages move and sometimes contradict each other (push protection's default on public repos is described two ways). The full research table with tiers and notes is not included here.
+
+Rows read from search snippets only (rulesets, immutable releases, Dependabot ecosystems, SECURITY.md locations) were not confirmed against the full page; check them when they matter. Secondary: EXIF behavior on GitHub came from a blog post and was not verified.
+
+- rotate first; rewrite side effects; `--sensitive-data-removal` ≥2.47; forks/cached views; Support purge
+  - https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository
+- private→public caveats (Actions logs, stars, push rulesets)
+  - https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/managing-repository-settings/setting-repository-visibility
+- noreply formats, July 18 2017
+  - https://docs.github.com/en/account-and-profile/reference/email-addresses-reference
+- per-repo `git config user.email`; privacy checkbox
+  - https://docs.github.com/en/account-and-profile/how-tos/email-preferences/setting-your-commit-email-address
+- block CLI pushes exposing email
+  - https://docs.github.com/en/account-and-profile/how-tos/email-preferences/blocking-command-line-pushes-that-expose-your-personal-email-address
+- fresh-clone workflow rationale
+  - https://github.com/newren/git-filter-repo
+- `git`/`dir` commands, archive/decode depth defaults, pre-commit, baseline
+  - https://github.com/gitleaks/gitleaks
+- verified results, filesystem/git sources, binaries, AGPL-3.0
+  - https://github.com/trufflesecurity/trufflehog
+- push protection, bypass, "disabled by default"
+  - https://docs.github.com/en/code-security/secret-scanning/introduction/about-push-protection
+- features free/default on public repos; partner notification
+  - https://docs.github.com/en/code-security/getting-started/github-security-features
+- Dependabot alerts not default; SPDX export; immutable releases; attestations
+  - https://docs.github.com/en/code-security/supply-chain-security/understanding-your-software-supply-chain/about-supply-chain-security
+- `actions/attest`, permissions, `gh attestation verify`, SBOM attestation
+  - https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations
+- least privilege, SHA pinning, `pull_request_target`, self-hosted runners
+  - https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions
+- fork-PR approval, workflow permissions, SHA-pin policy
+  - https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository
+- Scorecard checks, scoring tiers, solo-maintainer note
+  - https://github.com/ossf/scorecard/blob/main/docs/checks.md
+- OpenSSF passing criteria
+  - https://www.bestpractices.dev/en/criteria/0
+- four core files, naming/trademark, pre-launch checklist
+  - https://opensource.guide/starting-a-project/
+- public ≠ licensed, CLA/DCO, company-legal checklist incl. AI, trademarks
+  - https://opensource.guide/legal/
+- document expectations, saying no, templates, automation
+  - https://opensource.guide/best-practices/
+- announcing, home URL
+  - https://opensource.guide/finding-users/
+- welcome contributors, labels, be responsive
+  - https://opensource.guide/building-community/
+- community profile checklist
+  - https://docs.github.com/en/communities/setting-up-your-project-for-healthy-contributions/about-community-profiles-for-public-repositories
+- social preview size/format
+  - https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/customizing-your-repositorys-social-media-preview
+- enabling private vulnerability reporting
+  - https://docs.github.com/en/code-security/security-advisories/working-with-repository-security-advisories/configuring-private-vulnerability-reporting-for-a-repository
+- SECURITY.md steps; root/docs/.github locations (GHES 3.8 page, search snippet)
+  - https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/configure-vulnerability-reporting/add-security-policy
+  - https://docs.github.com/en/enterprise-server@3.8/code-security/getting-started/adding-a-security-policy-to-your-repository
+- CODEOWNERS
+  - https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+- FUNDING.yml
+  - https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
+- issue forms, config.yml
+  - https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository
+- Discussions toggle (search snippet)
+  - https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/enabling-or-disabling-github-discussions-for-a-repository
+- topic rules
+  - https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/classifying-your-repository-with-topics
+- rulesets, bypass, force-push block (search snippets)
+  - https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets
+  - https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches
+- enabling immutability; protections (search snippets)
+  - https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/establish-provenance-and-integrity/prevent-release-changes
+  - https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases
+- `releases/latest/download/<asset>`
+  - https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases
+- generated notes, `release.yml`, draft-then-publish with immutability, latest label
+  - https://docs.github.com/en/repositories/releasing-projects-on-github/automatically-generated-release-notes
+- Swift + github-actions ecosystems (search snippets)
+  - https://docs.github.com/en/code-security/dependabot/ecosystems-supported-by-dependabot/supported-ecosystems-and-repositories
+  - https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/secure-your-dependencies/configure-version-updates
+- public repos free on standard runners; macOS rate
+  - https://docs.github.com/en/billing/concepts/product-billing/github-actions
+- REUSE requirements
+  - https://reuse.software/spec-3.3/
+- GPL-3.0 conditions; no license = no permission
+  - https://choosealicense.com/licenses/gpl-3.0/
+  - https://choosealicense.com/no-permission/
+- per-file notice; employer copyright; contributor assignment
+  - https://www.gnu.org/licenses/gpl-faq.html
+- Apache-2.0 vs GPLv2; Expat/BSD compatible
+  - https://www.gnu.org/licenses/license-list.html
+- notarization purpose, requirements, `altool` end
+  - https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution
+- `notarytool`, keychain profile, log, stapling, 75/day
+  - https://developer.apple.com/documentation/security/customizing-the-notarization-workflow
+- codesign/spctl checks, hardened runtime, get-task-allow, entitlements
+  - https://developer.apple.com/documentation/security/resolving-common-notarization-issues
+- Account Holder role; 5-year validity; revocation via email (search snippets)
+  - https://developer.apple.com/help/account/certificates/create-developer-id-certificates
+  - https://developer.apple.com/support/developer-id
+  - https://developer.apple.com/help/account/reference/revoking-privileges
+- Gatekeeper behaviour (search snippet)
+  - https://support.apple.com/en-us/102445
+- EdDSA keys, `-x/-f`, rotation, signed feeds, HTTPS, library validation
+  - https://sparkle-project.org/documentation/
+- appcast/archive publishing
+  - https://sparkle-project.org/documentation/publishing/
+- Sparkle security fix history, `-s` deprecation
+  - https://sparkle-project.org/documentation/security-and-reliability/
+- `#file` vs `#filePath`, Swift 6 default, privacy rationale
+  - https://github.com/swiftlang/swift-evolution/blob/main/proposals/0274-magic-file.md
+- AGENTS.md format
+  - https://agents.md/
+- changelog format
+  - https://keepachangelog.com/en/1.1.0/
+- SemVer rules
+  - https://semver.org/

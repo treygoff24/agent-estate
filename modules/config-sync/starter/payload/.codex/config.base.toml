@@ -1,0 +1,6 @@
+# Managed by config-sync: only the keys named here are set in ~/.codex/config.toml on every
+# machine; every other key Codex or you put there is left alone. Single-line `key = value`
+# pairs under optional [table] headers only. Edit this posture before the first apply if it is
+# not the one you want.
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"

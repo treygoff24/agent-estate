@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Weekly: prune what backups forgot, then verify a random 10% of the data.
+set -euo pipefail
+: "${RESTIC_REPOSITORY:?RESTIC_REPOSITORY is not set}"
+: "${RESTIC_PASSWORD:?RESTIC_PASSWORD is not in the key file}"
+restic prune --retry-lock 30m
+restic check --retry-lock 30m --read-data-subset=10%

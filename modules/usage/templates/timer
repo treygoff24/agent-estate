@@ -1,0 +1,11 @@
+# Rendered by agent-estate (${label}) from estate.toml; do not edit here.
+[Unit]
+Description=agent-estate usage poll, every ${modules.usage.interval_seconds}s
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=${modules.usage.interval_seconds}s
+Unit=${label}.service
+
+[Install]
+WantedBy=timers.target

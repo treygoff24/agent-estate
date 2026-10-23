@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Doctor check: Tailscale is ready and the expiry timer runs. Warns when Tailscale is not set up.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+if [ "$ESTATE_PLATFORM" = mac ]; then
+  ok "not used on macOS (this module is Linux only)" "always, on macOS"
+fi
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+fix="run: estate install show"
+[ -n "$(cfg tailnet)" ] \
+  || warn "tailnet is empty in estate.toml: show needs Tailscale (set tailnet to your MagicDNS suffix)" "$DONE_WHEN"
+command -v tailscale >/dev/null \
+  || warn "tailscale is not installed: show publishes through Tailscale Serve" "$DONE_WHEN"
+state="$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null || true)"
+[ "$state" = Running ] \
+  || warn "Tailscale is not running here (state: ${state:-unreachable}); run: tailscale up" "$DONE_WHEN"
+[ "$(readlink "$BIN/estate-show" 2>/dev/null)" = "$ESTATE_MODULE_DIR/estate-show" ] \
+  || fail "not installed: $BIN/estate-show is missing or points elsewhere ($fix)" "$DONE_WHEN"
+for pair in "show-reap.service:$SERVICE" "show-reap.timer:$TIMER_FILE"; do
+  tpl="${pair%%:*}" dest="${pair#*:}"
+  [ -f "$dest" ] || fail "not installed: $dest is missing ($fix)" "$DONE_WHEN"
+  estate render "$ESTATE_MODULE_DIR/templates/$tpl" | cmp -s - "$dest" \
+    || fail "$dest does not match estate.toml ($fix)" "$DONE_WHEN"
+done
+systemctl --user is-enabled --quiet "$TIMER" || fail "$TIMER is not enabled ($fix)" "$DONE_WHEN"
+systemctl --user is-active --quiet "$TIMER" || fail "$TIMER is not active ($fix)" "$DONE_WHEN"
+ok "Tailscale is running; expired links are taken down every $(cfg modules.show.reap_minutes) min" "$DONE_WHEN"

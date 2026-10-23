@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Install the usage poller for this login. Idempotent; --dry-run changes nothing.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+msg="$(valid_settings)" || { say "$msg"; exit 1; }
+pin_python   # the wrapper names its interpreter: launchd's PATH has no usable python3
+
+put_script() { # DEST TEXT-FUNCTION
+  if [ "$ESTATE_DRY_RUN" = 1 ]; then
+    if [ -f "$1" ] && "$2" | cmp -s - "$1"; then printf 'unchanged: %s\n' "$1" >&2
+    else printf 'would write: %s\n' "$1" >&2; fi
+    return
+  fi
+  mkdir -p "$(dirname "$1")"
+  "$2" >"$1.tmp.$$" && chmod 755 "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"
+}
+put_script "$WRAPPER" wrapper_text
+put_script "$SHOW_BIN" show_text
+[ "$ESTATE_DRY_RUN" = 1 ] || chmod 700 "$USAGE_DIR"
+for pair in "${UNITS[@]}"; do
+  render "${pair%%:*}" "${pair#*:}"
+done
+if [ "$ESTATE_PLATFORM" = mac ]; then
+  uid="$(id -u)"
+  # Reload so a changed interval takes effect; bootout of an unloaded job is fine.
+  run launchctl bootout "gui/$uid/$LABEL" 2>/dev/null || true
+  run launchctl bootstrap "gui/$uid" "${UNITS[0]#*:}"
+else
+  run systemctl --user daemon-reload
+  run systemctl --user enable --now "$LABEL.timer"
+fi
+# First reading now, so the check is not red until the timer's first tick.
+# A failed poll is the check's business (warn), not the install's.
+run "$WRAPPER" poll || true
+say "installed: polling every ${INTERVAL}s; run usage-show"

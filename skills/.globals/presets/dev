@@ -1,0 +1,18 @@
+# dev: universal code kit. Install in any code repo.
+# Install: cd <repo> && skill add @dev
+
+# Planning and review
+brainstorming
+code-review
+receiving-code-review
+premortem
+
+# Test, debug, diagnose
+tdd
+debugging-systematic
+test-value-audit
+coverage-architect
+
+# Code quality
+quality-gate
+hillclimb

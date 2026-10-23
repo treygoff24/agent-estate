@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Doctor check: exit 0 ok, 1 fail, 2 warn; first line is the status.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+msg="$(valid_settings)" || fail "$msg" "$DONE_WHEN"
+fix="run: estate install post"
+postbin="$(find_post)"
+[ -n "$postbin" ] || fail "post is not on PATH ($fix; is $BIN on PATH?)" "$DONE_WHEN"
+rc=0
+"$postbin" doctor --brief >/dev/null 2>&1 || rc=$?
+case "$rc" in
+  0) ;;
+  1) warn "post doctor has findings (run: post doctor; post doctor --fix --brief fixes the routine ones)" "$DONE_WHEN" ;;
+  *) fail "post doctor failed (exit $rc; run: post doctor, then $fix)" "$DONE_WHEN" ;;
+esac
+if [ "$BRIDGE" = true ]; then
+  if [ "$ESTATE_PLATFORM" = mac ]; then
+    launchctl list "$BRIDGE_LABEL_MAC" >/dev/null 2>&1 || fail "the bridge agent $BRIDGE_LABEL_MAC is not loaded ($fix)" "$DONE_WHEN"
+  else
+    systemctl --user is-active --quiet "$BRIDGE_TIMER" || fail "$BRIDGE_TIMER is not active ($fix)" "$DONE_WHEN"
+  fi
+fi
+if [ "$HOOKS" = true ]; then
+  missing=()
+  while IFS= read -r h; do hook_present "$h" || missing+=("$h"); done < <(harnesses)
+  if [ "${#missing[@]}" -gt 0 ]; then
+    warn "the mail hook is not installed for: ${missing[*]} ($fix; hooks need Node.js)" "$DONE_WHEN"
+  fi
+fi
+extra=""
+[ "$BRIDGE" = true ] && extra=", bridge running"
+ok "post $("$postbin" --version 2>/dev/null | head -n1) healthy$extra" "$DONE_WHEN"

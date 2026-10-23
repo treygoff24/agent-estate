@@ -1,0 +1,24 @@
+# agent-env manifest. One row per line, fields separated by TAB:
+#   kind   source (in this repo)   dest (under $HOME)   [platform: mac | linux | all, default all]
+# kinds: file | tree | merge-json | merge-toml | link   (see README.md)
+# After editing: commit, push, and let the nightly sync (or `estate-config-sync apply`) install it.
+
+# Global instructions for each harness.
+file	home/.claude/CLAUDE.md	.claude/CLAUDE.md
+file	home/.codex/AGENTS.md	.codex/AGENTS.md
+
+# The doctrine pack: Claude Code loads ~/.claude/rules/*.md by itself; Codex is told to read
+# the same files from the doctrine directory. (Copied into home/doctrine/ when this repo was created.)
+file	home/doctrine/agent-operating-contract.md	.claude/rules/agent-operating-contract.md
+file	home/doctrine/shell-footguns.md	.claude/rules/shell-footguns.md
+tree	home/doctrine	.config/agent-estate/doctrine
+
+# Settings the harnesses also write: only the keys in these fragments are managed.
+merge-json	home/.claude/settings.json	.claude/settings.json
+merge-toml	home/.codex/config.base.toml	.codex/config.toml
+
+# The shell-footgun hook from agent-estate's guardrails module. `estate install config-sync` copies
+# its fragments in when it creates this repo: the Claude one is merged into home/.claude/settings.json
+# above, the Codex one is home/.codex/hooks.json. Hooks merge per command, so yours are kept.
+# Codex skips an unreviewed hook: start Codex once, open /hooks and trust it.
+merge-json	home/.codex/hooks.json	.codex/hooks.json

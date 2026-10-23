@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Doctor check: exit 0 ok, 1 fail, 2 warn; first line is the status.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+msg="$(valid_settings)" || fail "$msg" "$DONE_WHEN"
+fix="run: estate install usage"
+for pair in "${UNITS[@]}"; do
+  dest="${pair#*:}"
+  [ -f "$dest" ] || fail "not installed: $dest is missing ($fix)" "$DONE_WHEN"
+  estate render "$ESTATE_MODULE_DIR/templates/${pair%%:*}" | cmp -s - "$dest" \
+    || fail "$dest does not match estate.toml ($fix)" "$DONE_WHEN"
+done
+pinned_python || fail "the pinned Python 3.11+ ($(pin_file)) is missing or no longer works ($fix)" "$DONE_WHEN"
+{ [ -x "$WRAPPER" ] && wrapper_text | cmp -s - "$WRAPPER"; } \
+  || fail "$WRAPPER is missing or out of date ($fix)" "$DONE_WHEN"
+if [ "$ESTATE_PLATFORM" = mac ]; then
+  launchctl list "$LABEL" >/dev/null 2>&1 || fail "$LABEL is not loaded in launchd ($fix)" "$DONE_WHEN"
+else
+  systemctl --user is-enabled --quiet "$LABEL.timer" || fail "$LABEL.timer is not enabled ($fix)" "$DONE_WHEN"
+  systemctl --user is-active --quiet "$LABEL.timer" || fail "$LABEL.timer is not active ($fix)" "$DONE_WHEN"
+fi
+rc=0
+line="$("$WRAPPER" status)" || rc=$?
+case "$rc" in
+  0) ok "${line#ok: }" "$DONE_WHEN" ;;
+  2) warn "${line#warn: }" "$DONE_WHEN" ;;
+  *) fail "${line#fail: }" "$DONE_WHEN" ;;
+esac

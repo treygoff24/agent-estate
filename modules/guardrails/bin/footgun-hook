@@ -1,0 +1,810 @@
+#!/usr/bin/env python3
+"""footgun-hook: a PreToolUse hook that refuses machine-checkable shell footguns.
+
+Works as a Claude Code PreToolUse hook and as a Codex PreToolUse hook (both name
+the shell tool "Bash" and accept the same deny envelope). It reads the hook JSON
+on stdin and acts only on the Bash tool. To refuse, it prints the
+`hookSpecificOutput` deny envelope and exits 0; to allow, it prints nothing.
+Any error inside the hook allows the call: a guard that cannot read a command
+must not block work.
+
+Every rule decides from the command string alone, and every denial names the
+rule: "[footgun:<id>] <what is wrong and the fix>". Nothing is rewritten.
+
+Bypass, deliberately: put the token FOOTGUN-OK anywhere in the command (a
+comment is fine). Switch a rule off for this machine: list its id, one per
+line, in any ~/.config/agent-estate/footgun-skip* file (under $XDG_CONFIG_HOME when set),
+or in the comma-separated env var ESTATE_FOOTGUN_SKIP.
+
+Rules (the table at the bottom of this file is the list):
+  kill-by-pattern         pkill, killall, kill -1 (all processes)
+  rm-deadly-path          recursive rm/trash of "", ., .., /, ~, $HOME, *
+  rm-unguarded-variable   recursive rm/trash of "$VAR" or "$VAR/..." with no guard
+  heredoc-unquoted-dollar <<EOF (unquoted delimiter) whose body holds $ or backticks
+  find-delete             find ... -delete outside scratch directories
+  pipeline-exit-code      a head/tail pipeline's masked exit read via $? or gating a commit
+  heavy-test-unwrapped    tests/gates/builds not run through `testrun <repo> <kind> --`
+  rg-replace-flag         rg -rn (r means --replace, not recursive)
+  rg-help-flag            rg -h (help, not no-filename)
+  sed-bare-range          sed -n '10,20' (an address, not a script)
+  pnpm-double-dash        pnpm test -- <filter> (the -- de-scopes the run)
+  perl-i-truncate         perl -i with a manual <> slurp (truncates the file)
+"""
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+BYPASS = "FOOTGUN-OK"
+
+
+# --------------------------------------------------------------------------
+# A small quote-aware parser. Not a shell: it exists so that
+# `git commit -m "rm -rf $X"` and a heredoc body are not mistaken for commands.
+# --------------------------------------------------------------------------
+
+class Word:
+    __slots__ = ("text", "quoted", "started_quoted", "expands")
+
+    def __init__(self):
+        self.text = ""
+        self.quoted = False          # any part of the word was quoted or escaped
+        self.started_quoted = False
+        self.expands = False         # the shell will expand a $ in it
+
+
+class Stage:
+    def __init__(self):
+        self.words = []
+        self.heredocs = []           # (delimiter, quoted, body)
+
+
+class Statement:
+    def __init__(self, joiner, stages):
+        self.joiner = joiner
+        self.stages = stages
+
+
+NAME_START = re.compile(r"[A-Za-z_0-9?!@*#$-]")
+
+
+def read_balanced(src, i, open_c, close_c):
+    """src[i] == open_c; return index just past the matching close_c."""
+    depth, n = 0, len(src)
+    pending = []
+    while i < n:
+        c = src[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            j = src.find("'", i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        if c == '"':
+            i += 1
+            while i < n and src[i] != '"':
+                i += 2 if src[i] == "\\" else 1
+            i += 1
+            continue
+        if c == "<" and src.startswith("<<", i) and not src.startswith("<<<", i):
+            m = re.match(r"<<-?\s*(?:'([^']*)'|\"([^\"]*)\"|([A-Za-z_][A-Za-z0-9_]*))", src[i:])
+            if m:
+                pending.append(m.group(1) or m.group(2) or m.group(3))
+                i += m.end()
+                continue
+        if c == "\n" and pending:
+            i += 1
+            while pending and i < n:
+                delim = pending.pop(0)
+                while i < n:
+                    j = src.find("\n", i)
+                    line = src[i:] if j < 0 else src[i:j]
+                    i = n if j < 0 else j + 1
+                    if line.strip() == delim:
+                        break
+            continue
+        if c == open_c:
+            depth += 1
+        elif c == close_c:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def parse(src):
+    """Return (statements, substitutions, interpreter_strings)."""
+    statements, subs = [], []
+    stages, stage, word = [], Stage(), None
+    joiner = ";"
+    pending = []          # heredocs waiting for their body: (stage, delim, quoted, dash)
+    skip_next = False     # the next word is a redirection target
+    n, i = len(src), 0
+
+    def end_word():
+        nonlocal word, skip_next
+        if word is not None:
+            if skip_next:
+                skip_next = False
+            else:
+                stage.words.append(word)
+            word = None
+
+    def end_stage():
+        nonlocal stage
+        end_word()
+        if stage.words or stage.heredocs:
+            stages.append(stage)
+        stage = Stage()
+
+    def end_stmt(next_joiner):
+        nonlocal stages, joiner
+        end_stage()
+        if stages:
+            statements.append(Statement(joiner, stages))
+        stages = []
+        joiner = next_joiner
+
+    def cur():
+        nonlocal word
+        if word is None:
+            word = Word()
+        return word
+
+    while i < n:
+        c = src[i]
+        if c == "\\":
+            if i + 1 < n and src[i + 1] == "\n":
+                i += 2
+                continue
+            w = cur()
+            w.quoted = True
+            if not w.text:
+                w.started_quoted = True
+            w.text += src[i + 1] if i + 1 < n else ""
+            i += 2
+        elif c == "'":
+            w = cur()
+            if not w.text:
+                w.started_quoted = True
+            w.quoted = True
+            j = src.find("'", i + 1)
+            j = n if j < 0 else j
+            w.text += src[i + 1:j]
+            i = j + 1
+        elif c == '"':
+            w = cur()
+            if not w.text:
+                w.started_quoted = True
+            w.quoted = True
+            i += 1
+            while i < n and src[i] != '"':
+                d = src[i]
+                if d == "\\" and i + 1 < n:
+                    if src[i + 1] in '$`"\\':
+                        w.text += src[i + 1]
+                    else:
+                        w.text += d + src[i + 1]
+                    i += 2
+                elif d == "$" and i + 1 < n and src[i + 1] == "(":
+                    j = read_balanced(src, i + 1, "(", ")")
+                    subs.append(src[i + 2:j - 1])
+                    w.text += src[i:j]
+                    w.expands = True
+                    i = j
+                elif d == "$" and i + 1 < n and src[i + 1] == "{":
+                    j = src.find("}", i)
+                    j = n if j < 0 else j + 1
+                    w.text += src[i:j]
+                    w.expands = True
+                    i = j
+                elif d == "`":
+                    j = src.find("`", i + 1)
+                    j = n if j < 0 else j
+                    subs.append(src[i + 1:j])
+                    w.text += src[i:j + 1]
+                    w.expands = True
+                    i = j + 1
+                else:
+                    if d == "$" and i + 1 < n and NAME_START.match(src[i + 1]):
+                        w.expands = True
+                    w.text += d
+                    i += 1
+            i += 1
+        elif c == "$":
+            w = cur()
+            if src.startswith("$(", i):
+                j = read_balanced(src, i + 1, "(", ")")
+                subs.append(src[i + 2:j - 1])
+                w.text += src[i:j]
+                w.expands = True
+                i = j
+            elif src.startswith("${", i):
+                j = src.find("}", i)
+                j = n if j < 0 else j + 1
+                w.text += src[i:j]
+                w.expands = True
+                i = j
+            elif src.startswith("$'", i):
+                j = src.find("'", i + 2)
+                j = n if j < 0 else j
+                w.text += src[i + 2:j]
+                w.quoted = True
+                i = j + 1
+            else:
+                if i + 1 < n and NAME_START.match(src[i + 1]):
+                    w.expands = True
+                w.text += c
+                i += 1
+        elif c == "`":
+            w = cur()
+            j = src.find("`", i + 1)
+            j = n if j < 0 else j
+            subs.append(src[i + 1:j])
+            w.text += src[i:j + 1]
+            w.expands = True
+            i = j + 1
+        elif c == "#" and word is None:
+            j = src.find("\n", i)
+            i = n if j < 0 else j
+        elif c in " \t":
+            end_word()
+            i += 1
+        elif c == "\n":
+            end_stmt("\n")
+            i += 1
+            while pending:
+                st, delim, quoted, dash = pending.pop(0)
+                body = []
+                while i < n:
+                    j = src.find("\n", i)
+                    line = src[i:] if j < 0 else src[i:j]
+                    i = n if j < 0 else j + 1
+                    if (line.lstrip("\t") if dash else line) == delim:
+                        break
+                    body.append(line)
+                st.heredocs.append((delim, quoted, "\n".join(body)))
+        elif src.startswith("<<", i) and not src.startswith("<<<", i):
+            j = i + 2
+            dash = j < n and src[j] == "-"
+            if dash:
+                j += 1
+            while j < n and src[j] in " \t":
+                j += 1
+            delim, quoted = "", False
+            while j < n and src[j] not in " \t\n;&|<>()":
+                ch = src[j]
+                if ch in "'\"":
+                    quoted = True
+                    k = src.find(ch, j + 1)
+                    k = n if k < 0 else k
+                    delim += src[j + 1:k]
+                    j = k + 1
+                elif ch == "\\":
+                    quoted = True
+                    delim += src[j + 1:j + 2]
+                    j += 2
+                else:
+                    delim += ch
+                    j += 1
+            end_word()
+            pending.append((stage, delim, quoted, dash))
+            i = j
+        elif c in "<>" or (c == "&" and src.startswith("&>", i)):
+            # Redirection: drop an fd number glued in front, then the operator, then the target.
+            if word is not None and word.text.isdigit() and not word.quoted:
+                word = None
+            else:
+                end_word()
+            j = i + 1 if c == "&" else i
+            while j < n and src[j] in "<>":
+                j += 1
+            if j < n and src[j] == "&":      # >&2, 2>&1, >&-: the target is glued on
+                j += 1
+                while j < n and (src[j].isdigit() or src[j] == "-"):
+                    j += 1
+            else:
+                while j < n and src[j] in " \t":
+                    j += 1
+                skip_next = True
+            i = j
+        elif c == "&" and src.startswith("&&", i):
+            end_stmt("&&")
+            i += 2
+        elif c == "&":
+            end_stmt("&")
+            i += 1
+        elif c == "|" and src.startswith("||", i):
+            end_stmt("||")
+            i += 2
+        elif c == "|":
+            end_stage()
+            i += 2 if src.startswith("|&", i) else 1
+        elif c == ";":
+            end_stmt(";")
+            i += 2 if src.startswith(";;", i) else 1
+        elif c in "()":
+            end_stmt(c)
+            i += 1
+        else:
+            w = cur()
+            w.text += c
+            i += 1
+    end_stmt(";")
+    return statements, subs
+
+
+PREFIXES = {"!", "{", "}", "if", "then", "do", "else", "elif", "while", "until", "time",
+            "exec", "command", "builtin", "nohup", "setsid", "coproc"}
+ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def unwrap(words):
+    """(command name, args) after assignments and wrappers like sudo/env/nice/timeout."""
+    k, n = 0, len(words)
+    while k < n:
+        t = words[k].text
+        quoted = words[k].quoted
+        if not quoted and (t in PREFIXES or ASSIGN.match(t)):
+            k += 1
+        elif t in ("sudo", "doas"):
+            k += 1
+            while k < n and words[k].text.startswith("-"):
+                k += 2 if words[k].text in ("-u", "-g", "-C") else 1
+        elif t == "env":
+            k += 1
+            while k < n and (words[k].text.startswith("-") or ASSIGN.match(words[k].text)):
+                k += 1
+        elif t == "nice":
+            k += 1
+            while k < n and words[k].text.startswith("-"):
+                k += 2 if words[k].text == "-n" else 1
+        elif t == "timeout":
+            k += 1
+            while k < n and words[k].text.startswith("-"):
+                k += 2 if words[k].text in ("-s", "-k", "--signal", "--kill-after") else 1
+            k += 1  # the duration
+        else:
+            break
+    if k >= n:
+        return None, []
+    return os.path.basename(words[k].text), words[k + 1:]
+
+
+# --------------------------------------------------------------------------
+# Rules. Each takes a Context and returns None or a deny message.
+# --------------------------------------------------------------------------
+
+class Ctx:
+    def __init__(self, src, statements, si, stage_i, name, args):
+        self.src, self.statements = src, statements
+        self.si, self.stage_i = si, stage_i
+        self.name, self.args = name, args
+        self.cwd = ""
+
+    @property
+    def stmt(self):
+        return self.statements[self.si]
+
+    @property
+    def stage(self):
+        return self.stmt.stages[self.stage_i]
+
+    @property
+    def texts(self):
+        return [w.text for w in self.args]
+
+
+def flag_letters(words):
+    """Letters of each clustered short-option word (-rn -> 'rn'); skips quoted words."""
+    out = []
+    for w in words:
+        if not w.quoted and re.fullmatch(r"-[A-Za-z]+", w.text):
+            out.append(w.text[1:])
+    return out
+
+
+def rule_kill_by_pattern(c):
+    if c.name in ("pkill", "killall"):
+        if c.name == "pkill" and any(t == "-P" or t.startswith("--parent") for t in c.texts):
+            return None  # children of a pid you name: an owned tree
+        return (f"{c.name} matches by name across the whole host and will eventually kill a process "
+                "you did not start. Name a PID or a process group you created and can check "
+                "(kill -TERM <pid>, kill -TERM -- -<pgid>), or stop a testrun with `testrun --stop <repo>-<kind>`.")
+    if c.name == "kill":
+        rest = list(c.texts)
+        if rest and rest[0] == "-s" and len(rest) > 1:
+            rest = rest[2:]
+        elif rest and re.fullmatch(r"-(\d+|[A-Za-z][A-Za-z0-9]*)", rest[0]) and len(rest) > 1:
+            rest = rest[1:]
+        elif rest and rest[0] in ("-n",) and len(rest) > 2:
+            rest = rest[2:]
+        rest = [t for t in rest if t != "--"]
+        if "-1" in rest or c.texts == ["-1"]:
+            return ("kill -1 (pid -1) signals every process you are allowed to signal, your own login "
+                    "session included. Name the PID or process group you created.")
+    return None
+
+
+DEADLY = {"", ".", "./", "..", "../", "/", "~", "~/", "$HOME", "$HOME/", "${HOME}", "${HOME}/",
+          "*", "/*", "~/*", "./*"}
+SAFE_VARS = {"HOME", "PWD"}
+
+
+def is_recursive(c):
+    if c.name == "trash":
+        return True
+    return any((not w.quoted and (w.text in ("--recursive",) or re.fullmatch(r"-[A-Za-z]*[rR][A-Za-z]*", w.text)))
+               for w in c.args)
+
+
+def rule_rm_deadly_path(c):
+    if c.name not in ("rm", "trash") or not is_recursive(c):
+        return None
+    for w in c.args:
+        if not w.quoted and w.text.startswith("-"):
+            continue
+        if w.text == "--":
+            continue
+        if w.text in DEADLY:
+            shown = '""' if w.text == "" else w.text
+            what = ("an empty path (whatever variable you meant did not expand)" if w.text == ""
+                    else "the current directory or everything in it" if w.text in (".", "./", "*", "./*")
+                    else "your home or the filesystem root or their parent")
+            return (f"{c.name} {shown} targets {what}. Name the real path, and guard any variable first: "
+                    '[ -n "$p" ] || { echo "empty path" >&2; exit 1; }.')
+    return None
+
+
+VAR_AT_START = re.compile(r"^\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)([^}]*)\})(.*)$", re.S)
+
+
+def guarded(c, var):
+    """Is `var` tested, defaulted or required earlier in the same command?"""
+    for si, stmt in enumerate(c.statements[: c.si + 1]):
+        for stage in stmt.stages:
+            words = [w.text for w in stage.words]
+            joined = " ".join(words)
+            if re.search(r"\$\{" + var + r":\?", joined):
+                return True
+            if si < c.si or stmt is not c.stmt:
+                if words[:1] in (["["], ["[["], ["test"]) or "[" in words[:1] or "[[" in words[:1]:
+                    if any(t in ("-n", "-z") for t in words) and re.search(r"\$\{?" + var + r"\b", joined):
+                        return True
+                if len(words) > 3 and words[0] == "for" and words[1] == var and words[2] == "in" and \
+                        not any(w.expands for w in stage.words[3:]):
+                    return True
+                if words[:1] == ["set"] and any(re.fullmatch(r"-[A-Za-z]*u[A-Za-z]*", t) for t in words[1:]):
+                    return True
+                if words[:2] == ["set", "-o"] and "nounset" in words:
+                    return True
+                for t in words:
+                    m = re.match(r"^" + var + r"=(.*)$", t, re.S)
+                    if m and m.group(1) and not re.search(r"[$`]", m.group(1)):
+                        return True
+                    if m and m.group(1).startswith("$(mktemp"):
+                        return True
+    return False
+
+
+def rule_rm_unguarded_variable(c):
+    if c.name not in ("rm", "trash") or not is_recursive(c):
+        return None
+    for w in c.args:
+        if (not w.quoted and w.text.startswith("-")) or not w.expands:
+            continue
+        m = VAR_AT_START.match(w.text)
+        if not m:
+            continue
+        var = m.group(1) or m.group(2)
+        modifier = m.group(3) or ""
+        if var in SAFE_VARS:
+            continue
+        if modifier.startswith(":?") or modifier.startswith("?"):
+            continue
+        if re.match(r"^:?-.", modifier) or re.match(r"^:?=.", modifier):
+            continue  # a non-empty default
+        if guarded(c, var):
+            continue
+        return (f'A possibly empty ${var} in a deletion path can resolve to the current directory or the root '
+                f'("${var}/sub" becomes "/sub"). Use "${{{var}:?}}" in the path, or put '
+                f'[ -n "${var}" ] || exit 1 before it, and inspect the resolved path before deleting.')
+    return None
+
+
+def rule_heredoc_unquoted_dollar(c):
+    for delim, quoted, body in c.stage.heredocs:
+        if quoted:
+            continue
+        scrubbed = re.sub(r"\\[$`\\]", "", body)
+        if re.search(r"\$[({A-Za-z_0-9@*#?!$-]|`", scrubbed):
+            return ("An unquoted heredoc (<<" + delim + ") expands ${VAR}, $(...) and backticks in its body "
+                    "before the program reads it, and an unset variable becomes an empty string with no "
+                    "warning. Quote the delimiter: <<'" + delim + "'. If you do want the expansion, add "
+                    "# FOOTGUN-OK to the command.")
+    return None
+
+
+SCRATCH = re.compile(r"^(/tmp/|/var/tmp/|/private/tmp/|\$TMPDIR|\$\{TMPDIR)")
+
+
+def rule_find_delete(c):
+    if c.name != "find" or not any((not w.quoted and w.text == "-delete") for w in c.args):
+        return None
+    starts = []
+    for w in c.args:
+        if w.text.startswith("-") or w.text in ("!", "("):
+            break
+        starts.append(w.text)
+    if starts and all(SCRATCH.match(s) for s in starts):
+        return None
+    return ("find -delete removes every match immediately, and one wrong predicate or start path deletes "
+            "something you did not mean. List first with find ... -print, read the paths, then delete the "
+            "ones you meant by name (or point find at a /tmp scratch directory).")
+
+
+TAILERS = {"tail", "head"}
+
+
+def has_pipefail(src):
+    return bool(re.search(r"pipefail", src))
+
+
+def rule_pipeline_exit_code(c):
+    if c.stage_i != 0:
+        return None
+    stmts = c.statements
+    stmt = c.stmt
+    if len(stmt.stages) < 2 or has_pipefail(c.src):
+        return None
+    last_name, _ = unwrap(stmt.stages[-1].words)
+    if last_name not in TAILERS:
+        return None
+    # $? read in a later statement of the same command, or a commit/push gated on the pipeline.
+    for later in stmts[c.si + 1:]:
+        if later.joiner in ("&&",) or later.joiner in (";", "\n"):
+            for stage in later.stages:
+                name, args = unwrap(stage.words)
+                if later.joiner == "&&" and name == "git" and any(a.text in ("commit", "push") for a in args):
+                    return _pipeline_msg()
+                if any("$?" in w.text for w in stage.words):
+                    return _pipeline_msg()
+        if later.joiner in ("&&",):
+            continue
+    return None
+
+
+def _pipeline_msg():
+    return ("A pipeline's exit status is its last stage's: `gate | tail -20` reports tail's success even "
+            "when the gate failed, so `echo $?` or `&& git commit` after it is not a verdict. Use "
+            "`set -o pipefail`, or write the output to a file and check the command's own exit.")
+
+
+HEAVY_PATTERNS = [
+    ("cargo", lambda a: bool(a) and a[0] in ("test", "nextest", "bench")),
+    ("pytest", lambda a: True), ("py.test", lambda a: True),
+    ("vitest", lambda a: bool(a) and a[0] != "--version"), ("jest", lambda a: True),
+    ("go", lambda a: bool(a) and a[0] == "test"),
+    ("make", lambda a: any(x in ("test", "check", "tests", "gate") for x in a)),
+    ("tox", lambda a: True), ("nox", lambda a: True),
+]
+PKG_MANAGERS = {"pnpm", "npm", "yarn", "bun"}
+HEAVY_SCRIPT = re.compile(r"^(?:test|tests|gate|ci|e2e|coverage|test:.*)$")
+INTERPRETERS = {"python", "python3", "python3.11", "python3.12", "python3.13"}
+HEAVY_SCRIPT_FILE = re.compile(r"(^|/)(gate|run-tests|test-all)(\.sh|\.py)?$")
+
+
+def rule_heavy_test_unwrapped(c):
+    texts = c.texts
+    if any(t in ("-h", "--help", "--version") for t in texts):
+        return None
+    heavy = None
+    for name, test in HEAVY_PATTERNS:
+        if c.name == name and test(texts):
+            heavy = f"{c.name} {' '.join(texts[:2])}".strip()
+    if c.name in PKG_MANAGERS:
+        k = 0
+        while k < len(texts) and texts[k].startswith("-"):
+            k += 1
+        if k < len(texts):
+            if texts[k] == "test" or (texts[k] in ("run", "run-script") and k + 1 < len(texts)
+                                      and HEAVY_SCRIPT.match(texts[k + 1])):
+                heavy = f"{c.name} {' '.join(texts[k:k + 2])}"
+    if c.name in INTERPRETERS or re.fullmatch(r"python[0-9.]*", c.name):
+        for k, t in enumerate(texts[:-1]):
+            if t == "-m" and texts[k + 1] in ("pytest", "unittest"):
+                heavy = f"{c.name} -m {texts[k + 1]}"
+    if c.name in ("bash", "sh", "zsh") and texts and "-c" not in texts and HEAVY_SCRIPT_FILE.search(texts[0]):
+        heavy = f"{c.name} {texts[0]}"
+    if HEAVY_SCRIPT_FILE.search(c.name):
+        heavy = c.name
+    if not heavy:
+        return None
+    repo = re.sub(r"[^a-z0-9-]+", "-", os.path.basename(c.cwd.rstrip("/")).lower()).strip("-") or "<repo>"
+    return (f"`{heavy}` is a heavy run, and heavy runs go through testrun: it caps CPU and memory, refuses a "
+            f"second copy of the same run, and kills the whole tree at a time limit. Re-issue it as: "
+            f"testrun {repo} <kind> -- {c.stage_text()}   (kind: gate, unit, e2e, ...).")
+
+
+def rule_rg_replace_flag(c):
+    if c.name != "rg":
+        return None
+    for g in flag_letters(c.args):
+        k = g.find("r")
+        if k != -1 and k < len(g) - 1:
+            return (f'In ripgrep -{g}, "r" is --replace and "{g[k + 1]}" is its replacement text; rg already '
+                    "recurses. It prints every match rewritten to that literal, which looks like a real result "
+                    "and is fabricated. Drop the r.")
+    return None
+
+
+def rule_rg_help_flag(c):
+    if c.name != "rg":
+        return None
+    operands = [w for w in c.args if w.quoted or not w.text.startswith("-")]
+    for g in flag_letters(c.args):
+        if "h" in g and (len(g) > 1 or operands):
+            return "In ripgrep -h is --help, not 'no filename' (that is grep). Use -I to suppress filenames."
+    return None
+
+
+def rule_sed_bare_range(c):
+    if c.name != "sed":
+        return None
+    for w in c.args:
+        if w.quoted and re.fullmatch(r"[0-9]+,[0-9]+", w.text):
+            return (f"sed -n '{w.text}' is an error (\"missing command\"): a range is an address, not a "
+                    f"script. Append the command: sed -n '{w.text}p' <file>.")
+    return None
+
+
+def rule_pnpm_double_dash(c):
+    if c.name != "pnpm":
+        return None
+    t = c.texts
+    k = 0
+    while k < len(t) and t[k].startswith("-"):
+        k += 1
+    if k < len(t) and t[k] == "run":
+        k += 1
+    if k < len(t) and t[k] in ("install", "add", "exec", "dlx", "i", "remove", "update"):
+        return None
+    if k + 2 < len(t) and t[k + 1] == "--":
+        return (f"With pnpm, `{t[k]} -- <file>` runs the whole suite and passes, so nothing signals that the "
+                f"filter was dropped. Pass the filter without the --: pnpm {t[k]} {t[k + 2]}.")
+    return None
+
+
+def rule_perl_i_truncate(c):
+    if c.name != "perl":
+        return None
+    has_i = has_loop = False
+    code = ""
+    for k, w in enumerate(c.args):
+        t = w.text
+        if w.quoted or not t.startswith("-") or t.startswith("--"):
+            continue
+        letters = re.sub(r"\..*$", "", t[1:])
+        has_i = has_i or "i" in letters
+        has_loop = has_loop or "p" in letters or "n" in letters
+        if letters.endswith(("e", "E")) and k + 1 < len(c.args):
+            code += " " + c.args[k + 1].text
+    if has_i and not has_loop and re.search(r"=\s*<>", code):
+        return ("perl -i only redirects output to the file inside a -p/-n loop. With a manual <> slurp it "
+                "truncates the file to 0 bytes. Use -p/-n, or byte-safe python for end-of-file edits.")
+    return None
+
+
+RULES = [
+    ("kill-by-pattern", rule_kill_by_pattern),
+    ("rm-deadly-path", rule_rm_deadly_path),
+    ("rm-unguarded-variable", rule_rm_unguarded_variable),
+    ("heredoc-unquoted-dollar", rule_heredoc_unquoted_dollar),
+    ("find-delete", rule_find_delete),
+    ("pipeline-exit-code", rule_pipeline_exit_code),
+    ("rg-replace-flag", rule_rg_replace_flag),
+    ("rg-help-flag", rule_rg_help_flag),
+    ("sed-bare-range", rule_sed_bare_range),
+    ("pnpm-double-dash", rule_pnpm_double_dash),
+    ("perl-i-truncate", rule_perl_i_truncate),
+    ("heavy-test-unwrapped", rule_heavy_test_unwrapped),  # last: a more specific rule explains better
+]
+
+
+def stage_text(self):
+    return " ".join(w.text if not re.search(r"\s", w.text) else repr(w.text) for w in self.stage.words)
+
+
+Ctx.stage_text = stage_text
+
+
+def skipped_rules():
+    skip = {s.strip() for s in os.environ.get("ESTATE_FOOTGUN_SKIP", "").split(",") if s.strip()}
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "agent-estate"
+    try:
+        for f in base.glob("footgun-skip*"):
+            skip |= {l.strip() for l in f.read_text().splitlines() if l.strip() and not l.startswith("#")}
+    except OSError:
+        pass
+    return skip
+
+
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+
+
+def check(src, skip=frozenset(), cwd="", depth=0):
+    """Return '[footgun:<id>] <message>' for the first violated rule, or None."""
+    if depth > 4:
+        return None
+    statements, subs = parse(src)
+    for si, stmt in enumerate(statements):
+        for stage_i, stage in enumerate(stmt.stages):
+            name, args = unwrap(stage.words)
+            if name is None:
+                # A bare heredoc, e.g. `<<EOF` feeding nothing: still judge it.
+                name, args = "", []
+            c = Ctx(src, statements, si, stage_i, name, args)
+            c.cwd = cwd
+            for rule_id, fn in RULES:
+                if rule_id in skip:
+                    continue
+                msg = fn(c)
+                if msg:
+                    return f"[footgun:{rule_id}] {msg}"
+            # bash -c '<script>' and friends: judge the script.
+            if name in SHELLS:
+                texts = [w.text for w in args]
+                for k, t in enumerate(texts):
+                    if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", t) and k + 1 < len(texts):
+                        hit = check(texts[k + 1], skip, cwd, depth + 1)
+                        if hit:
+                            return hit
+                        break
+    for sub in subs:
+        hit = check(sub, skip, cwd, depth + 1)
+        if hit:
+            return hit
+    return None
+
+
+def command_text(tool_input):
+    cmd = tool_input.get("command")
+    if isinstance(cmd, str):
+        return cmd
+    if isinstance(cmd, list):
+        parts = [p for p in cmd if isinstance(p, str)]
+        for k, p in enumerate(parts):
+            if p in ("-c", "-lc", "-ic", "-lic") and k + 1 < len(parts):
+                return parts[k + 1]
+        return " ".join(parts)
+    return ""
+
+
+def main():
+    try:
+        payload = json.loads(sys.stdin.read())
+        if str(payload.get("tool_name", "")).strip() != "Bash":
+            return 0
+        tool_input = payload.get("tool_input") or {}
+        command = command_text(tool_input)
+        if not command or BYPASS in command:
+            return 0
+        cwd = str(payload.get("cwd") or tool_input.get("cwd") or tool_input.get("workdir") or "")
+        reason = check(command, skipped_rules(), cwd)
+    except Exception:  # a hook bug must never stand between an agent and its work
+        return 0
+    if reason:
+        if not reason.startswith("[footgun:heavy-test-unwrapped]"):
+            reason += ' To bypass deliberately, put "# FOOTGUN-OK" in the command.'
+        sys.stdout.write(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason}}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

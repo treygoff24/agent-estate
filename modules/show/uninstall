@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Take down every published link, then remove the timer and the estate-show link. If any
+# publication cannot be confirmed removed, fail and leave the timer, link and state in place so
+# the expiry keeps running and a retry can finish. --force (or ESTATE_SHOW_FORCE=1) removes the
+# machinery anyway and prints the links still up; `estate uninstall` does not pass flags on, so
+# through it use the environment variable.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+[ "$ESTATE_PLATFORM" = mac ] && exit 0
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+force="${ESTATE_SHOW_FORCE:-0}"
+for _arg in "$@"; do
+  [ "$_arg" = "--force" ] && force=1
+done
+unset _arg
+SHOW="$ESTATE_MODULE_DIR/estate-show"
+
+# Names of what is still published; fails when the listing itself fails.
+live_names() {
+  local out
+  out="$("$SHOW" ls --json)" || return 1
+  printf '%s' "$out" | python3 -c 'import json,sys; [print(e["name"]) for e in json.load(sys.stdin)["data"]["entries"]]'
+}
+
+if [ -x "$SHOW" ]; then
+  if [ "$ESTATE_DRY_RUN" = 1 ]; then
+    say "would take down every published link"
+  else
+    if ! names="$(live_names)"; then
+      if [ "$force" != 1 ]; then
+        say "cannot list what is published (estate-show ls failed); leaving the timer, link and state in place. Fix it and retry, or ESTATE_SHOW_FORCE=1 to remove them anyway."
+        exit 1
+      fi
+      say "cannot list what is published; removing the machinery anyway (--force)"
+      names=""
+    fi
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      "$SHOW" rm "$n" >/dev/null || say "could not take down $n"
+    done <<<"$names"
+    if left="$(live_names)" && [ -z "$left" ]; then
+      :
+    else
+      if [ "$force" != 1 ]; then
+        say "these links are still published (or cannot be confirmed gone), so the expiry timer, estate-show link and state stay in place:"
+        "$SHOW" ls >&2 || true
+        say "fix Tailscale (see: tailscale status) and run: estate uninstall show"
+        exit 1
+      fi
+      say "--force: these links may still be up and will no longer expire:"
+      "$SHOW" ls >&2 || true
+    fi
+  fi
+fi
+run systemctl --user disable --now "$TIMER" 2>/dev/null || true
+run rm -f -- "$SERVICE" "$TIMER_FILE"
+run systemctl --user daemon-reload
+if [ "$(readlink "$BIN/estate-show" 2>/dev/null)" = "$ESTATE_MODULE_DIR/estate-show" ]; then
+  run rm -f -- "$BIN/estate-show"
+fi
+say "removed the expiry timer and the estate-show link"

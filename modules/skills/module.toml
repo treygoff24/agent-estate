@@ -1,0 +1,17 @@
+name = "skills"
+description = "One skills pool, seeded from the starter pool and rendered into every harness by skillherd"
+platforms = ["mac", "linux"]
+requires = []
+
+[prerequisites]
+all = ["git", "bash"]
+
+# Every setting this module reads, with its default. Override any of them
+# in estate.toml under [modules.skills]; an unlisted key is an error.
+[defaults]
+repo_url = "https://github.com/treygoff24/skillherd"  # or point checkout at a local clone
+checkout = ""          # the skillherd checkout; "" means <paths.code>/skillherd (a leading ~ is fine)
+pool = ""              # the skill library; "" means paths.skills (default ~/.agents/skill-library)
+pool_remote = ""       # git URL of a skills repo to use as the pool; "" for a plain local folder
+seed = true            # fill a new, empty pool from the starter skills in this repo
+register_sync = true   # add a row for the checkout to the sync repo table

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Remove this module's two files. Leaves the stock timer enabled: it only
+# runs the user cleaner, which existed before this module.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+[ "$ESTATE_PLATFORM" = mac ] && exit 0
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+run rm -f -- "$TMPFILES_CONF" "$TIMER_DROPIN"
+run systemctl --user daemon-reload
+say "removed: $TMPFILES_CONF, $TIMER_DROPIN"

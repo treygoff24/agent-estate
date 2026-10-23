@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Remove the hourly job and the estate-health link. Keeps the report history under the state dir.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+if [ "$ESTATE_PLATFORM" = mac ]; then
+  run launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+  run rm -f -- "$PLIST"
+else
+  run systemctl --user disable --now "$TIMER" 2>/dev/null || true
+  run rm -f -- "$SERVICE" "$TIMER_FILE"
+  run systemctl --user daemon-reload
+fi
+if [ "$(readlink "$BIN/estate-health" 2>/dev/null)" = "$ESTATE_MODULE_DIR/estate-health" ]; then
+  run rm -f -- "$BIN/estate-health"
+fi
+say "removed the hourly health job (reports under $STATE are kept)"

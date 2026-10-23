@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Doctor check: exit 0 ok, 1 fail, 2 warn; first line is the status. Changes nothing, needs no root.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+msg="$(valid_settings)" || fail "$msg" "$DONE_WHEN"
+
+if [ "$ESTATE_PLATFORM" = mac ]; then
+  TS=tailscale
+  command -v tailscale >/dev/null 2>&1 || TS=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+  if [ "$TAILSCALE" != true ]; then
+    TS_MSG="Tailscale is not required (tailscale = false)"
+  else
+    TS_MSG="Tailscale up"
+    if ! command -v "$TS" >/dev/null 2>&1 && [ ! -x "$TS" ]; then
+      meh "Tailscale is not installed (https://tailscale.com/download/mac)"
+    elif ! "$TS" ip -4 >/dev/null 2>&1; then
+      meh "Tailscale is installed but not connected: open it and log in"
+    fi
+  fi
+  if [ "$BACKUPS" = true ] && ! tmutil destinationinfo 2>/dev/null | grep -q '^Name'; then
+    meh "backups are enabled but no Time Machine destination is set (System Settings > General > Time Machine)"
+  fi
+  [ -z "$WARNS" ] || warn "$(printf '%s' "${WARNS%$'\n'}" | tr '\n' ';')" "Tailscale is up on the Mac (and a backup destination is set, if backups = true)"
+  ok "Mac: $TS_MSG; nothing else to do here" "Tailscale is up on the Mac (and a backup destination is set, if backups = true)"
+fi
+
+linux_root_problems
+[ "$BACKUPS" = true ] && backup_problems
+if [ -n "$FAILS" ]; then
+  fail "$(printf '%s' "${FAILS%$'\n'}" | tr '\n' ';' | sed 's/;/; /g')" "$DONE_WHEN ($(root_setup_command))"
+fi
+if [ -n "$WARNS" ]; then
+  warn "$(printf '%s' "${WARNS%$'\n'}" | tr '\n' ';' | sed 's/;/; /g')" "$DONE_WHEN"
+fi
+extra=""; [ "$BACKUPS" = true ] && extra=", daily backups"
+ok "agents' login '$AGENT_USER', firewall$([ "$PUBLIC_SSH" = true ] && echo " (public SSH on $SSH_PORT)" || echo " (tailnet only)"), security updates$extra" "$DONE_WHEN"

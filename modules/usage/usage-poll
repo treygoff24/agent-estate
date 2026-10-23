@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""Poll subscription usage for Claude and Codex logins; write one JSON snapshot.
+
+  usage-poll poll          read each configured account, write the snapshot
+  usage-poll status        one status line for the doctor check (exit 0/1/2)
+  usage-poll show [--json] print the snapshot as a short table (or raw JSON)
+
+Run through the wrapper `install` writes (it sets ESTATE_ROOT, ESTATE_CONFIG,
+ESTATE_STATE). Python 3.11+, standard library only. Credentials are read from
+where the stock harness keeps them; see README.md for what is ever written.
+
+Test hooks (environment): ESTATE_USAGE_CLAUDE_API (default
+https://api.anthropic.com), ESTATE_USAGE_CLAUDE_TOKEN_URL, ESTATE_USAGE_CODEX_URL.
+"""
+
+import base64
+import datetime as dt
+import http.client
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+SNAPSHOT_VERSION = 1
+HTTP_TIMEOUT = 25
+OAUTH_BETA = "oauth-2026-04-20"
+# Claude Code's OAuth client ids (the first is primary).
+CLIENT_IDS = ("9d1c250a-e61b-44d9-88ed-5944d1962f5e", "22422756-60c9-4084-8eb7-27705fd5cf9a")
+EXPIRY_SKEW_SECONDS = 60
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def claude_api() -> str:
+    return os.environ.get("ESTATE_USAGE_CLAUDE_API", "https://api.anthropic.com")
+
+
+def claude_token_url() -> str:
+    return os.environ.get("ESTATE_USAGE_CLAUDE_TOKEN_URL",
+                          "https://platform.claude.com/v1/oauth/token")
+
+
+def codex_url() -> str:
+    return os.environ.get("ESTATE_USAGE_CODEX_URL", "https://chatgpt.com/backend-api/wham/usage")
+
+
+# ---------------------------------------------------------------- parsing
+
+def parse_iso(value):
+    """ISO 8601 to epoch seconds; None when unreadable."""
+    if not isinstance(value, str) or not value:
+        return None
+    s = value.strip()
+    if s[-1:] in ("Z", "z"):
+        s = s[:-1] + "+00:00"
+    s = re.sub(r"(\.\d{6})\d+", r"\1", s)
+    try:
+        return int(dt.datetime.fromisoformat(s).timestamp())
+    except ValueError:
+        return None
+
+
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def parse_claude_limits(usage: dict) -> list[dict]:
+    """Normalize a Claude `/api/oauth/usage` response into limit rows."""
+    rows = []
+    for raw in usage.get("limits") or []:
+        if not isinstance(raw, dict) or not _num(raw.get("percent")):
+            continue
+        scope = raw.get("scope") or {}
+        model = scope.get("model") if isinstance(scope, dict) else None
+        rows.append({
+            "kind": str(raw.get("kind") or "unknown"),
+            "model": model.get("display_name") if isinstance(model, dict) else None,
+            "percent": float(raw["percent"]),
+            "resets_at": parse_iso(raw.get("resets_at")),
+        })
+    if not rows:  # older shape: five_hour / seven_day objects only
+        for key, kind in (("five_hour", "session"), ("seven_day", "weekly_all")):
+            win = usage.get(key)
+            if isinstance(win, dict) and _num(win.get("utilization")):
+                rows.append({"kind": kind, "model": None, "percent": float(win["utilization"]),
+                             "resets_at": parse_iso(win.get("resets_at"))})
+    return rows
+
+
+def parse_codex_usage(body: dict) -> dict:
+    """Normalize a ChatGPT `/wham/usage` response."""
+    rate = body.get("rate_limit")
+    rate = rate if isinstance(rate, dict) else {}
+    limits = []
+    for key in ("primary_window", "secondary_window"):
+        win = rate.get(key)
+        if not isinstance(win, dict) or not _num(win.get("used_percent")):
+            continue
+        seconds = win.get("limit_window_seconds")
+        if seconds == 5 * 3600:
+            kind = "session"
+        elif seconds == 7 * 86400:
+            kind = "weekly_all"
+        elif _num(seconds) and seconds > 0:
+            kind = f"window_{int(seconds) // 3600}h"
+        else:
+            kind = "unknown"
+        reset = win.get("reset_at")
+        limits.append({"kind": kind, "model": None, "percent": float(win["used_percent"]),
+                       "resets_at": int(reset) if _num(reset) else None})
+    return {"limits": limits, "plan": body.get("plan_type"),
+            "limit_reached": bool(rate.get("limit_reached"))}
+
+
+def label(row: dict) -> str:
+    kind = row["kind"]
+    if kind == "session":
+        return "5h"
+    if kind == "weekly_all":
+        return "7d"
+    if kind == "weekly_scoped":
+        return (row.get("model") or "scoped").lower()
+    return kind
+
+
+def jwt_exp(token):
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(part)).get("exp")
+    except (IndexError, ValueError, TypeError, AttributeError):
+        return None
+    return int(exp) if _num(exp) else None
+
+
+# ---------------------------------------------------------------- HTTP
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A bearer token must never follow a redirect to another host."""
+
+    def redirect_request(self, *a, **k):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def http_json(url, *, token=None, body=None, headers=None):
+    """One JSON call. Returns (status, payload); status 0 means a network error."""
+    h = {"User-Agent": "agent-estate-usage", "Accept": "application/json"}
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    data = None
+    if body is not None:
+        h["Content-Type"] = "application/json"
+        data = json.dumps(body).encode()
+    h.update(headers or {})
+    req = urllib.request.Request(url, headers=h, data=data)
+    try:
+        with _OPENER.open(req, timeout=HTTP_TIMEOUT) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except ValueError:
+            return e.code, {}
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
+        return 0, {"error": type(exc).__name__}
+
+
+def status_name(code: int) -> str:
+    return {401: "expired", 403: "no_scope", 0: "network_error"}.get(code, f"http_{code}")
+
+
+# ---------------------------------------------------------------- credentials
+
+def account_dir(harness: str, account: str) -> Path:
+    home = Path(os.path.expanduser("~"))
+    if account == "default":
+        env = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}[harness]
+        if os.environ.get(env):
+            return Path(os.path.expanduser(os.environ[env]))
+        return home / f".{harness}"
+    return home / f".{harness}-{account}"
+
+
+def read_claude_login(account: str):
+    """Return (payload, source) where source is a Path or 'keychain'; (None, None) if absent.
+    Stock Claude Code keeps the login in <dir>/.credentials.json (Linux) or, on a Mac,
+    in the login keychain item 'Claude Code-credentials' (default account only)."""
+    path = account_dir("claude", account) / ".credentials.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), path
+    except (OSError, ValueError):
+        pass
+    if sys.platform == "darwin" and account == "default":
+        try:
+            p = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+                               capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
+            if p.returncode == 0 and p.stdout.strip():
+                return json.loads(p.stdout), "keychain"
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    return None, None
+
+
+def write_json_atomic(path: Path, data, mode=None):
+    """Write JSON next to its destination and rename into place."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if mode is None:
+        try:
+            mode = path.stat().st_mode & 0o777
+        except OSError:
+            mode = 0o600
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(data, out, indent=1, sort_keys=True)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def refresh_claude(oauth: dict):
+    rt = oauth.get("refreshToken")
+    if not rt:
+        return None, "no_refresh_token"
+    scopes = oauth.get("scopes") or []
+    last = "refresh_failed"
+    for cid in CLIENT_IDS:
+        body = {"grant_type": "refresh_token", "refresh_token": rt, "client_id": cid}
+        if scopes:
+            body["scope"] = " ".join(scopes)
+        code, resp = http_json(claude_token_url(), body=body)
+        if code == 200 and isinstance(resp, dict) and resp.get("access_token"):
+            return resp, "ok"
+        err = resp.get("error") if isinstance(resp, dict) else None
+        last = f"refresh_failed:{code}:{err}"
+        if err != "invalid_client":
+            break
+    return None, last
+
+
+def merge_refresh(oauth: dict, resp: dict, now_ms: int) -> dict:
+    out = dict(oauth)
+    out["accessToken"] = resp["access_token"]
+    if resp.get("refresh_token"):
+        out["refreshToken"] = resp["refresh_token"]
+    if _num(resp.get("expires_in")):
+        out["expiresAt"] = now_ms + int(resp["expires_in"]) * 1000
+    if isinstance(resp.get("scope"), str) and resp["scope"]:
+        out["scopes"] = resp["scope"].split()
+    return out
+
+
+# ---------------------------------------------------------------- polling
+
+def poll_claude(account: str, now: int, refresh: bool) -> dict:
+    row = {"harness": "claude", "account": account, "status": "unknown", "limits": []}
+    payload, source = read_claude_login(account)
+    oauth = (payload or {}).get("claudeAiOauth") if isinstance(payload, dict) else None
+    if not isinstance(oauth, dict) or not oauth.get("accessToken"):
+        row["status"] = "no_login"
+        return row
+    if oauth.get("subscriptionType"):
+        row["plan"] = oauth["subscriptionType"]
+    exp = oauth.get("expiresAt")
+    row["token"] = {"access_expires_at": int(exp / 1000) if _num(exp) else None, "refreshed": False}
+    if not _num(exp) or exp <= (now + EXPIRY_SKEW_SECONDS) * 1000:
+        # Only an expired login is refreshed, and only where we can write it back
+        # safely: the credentials file. A keychain login is left to Claude Code.
+        if not refresh or source == "keychain":
+            row["status"] = "expired"
+            return row
+        resp, why = refresh_claude(oauth)
+        if resp is None:
+            row["status"] = why
+            return row
+        # The refresh token rotates. Re-read first: if Claude Code refreshed in the
+        # meantime, our response is the stale one; drop it and use the file as it is.
+        again, _ = read_claude_login(account)
+        current = (again or {}).get("claudeAiOauth") or {}
+        if current.get("refreshToken") != oauth.get("refreshToken"):
+            payload, oauth = again, current
+        else:
+            oauth = merge_refresh(oauth, resp, now * 1000)
+            payload = dict(payload)
+            payload["claudeAiOauth"] = oauth
+            try:
+                write_json_atomic(source, payload)
+            except OSError:
+                row["status"] = "refresh_write_failed"
+                return row
+            row["token"]["refreshed"] = True
+        row["token"]["access_expires_at"] = (
+            int(oauth["expiresAt"] / 1000) if _num(oauth.get("expiresAt")) else None)
+    code, body = http_json(claude_api() + "/api/oauth/usage", token=oauth["accessToken"],
+                           headers={"anthropic-beta": OAUTH_BETA})
+    if code != 200 or not isinstance(body, dict):
+        row["status"] = status_name(code)
+        return row
+    row["status"] = "ok"
+    row["limits"] = parse_claude_limits(body)
+    return row
+
+
+def poll_codex(account: str, now: int) -> dict:
+    """Read-only: a Codex login is never refreshed or written."""
+    row = {"harness": "codex", "account": account, "status": "unknown", "limits": []}
+    try:
+        auth = json.loads((account_dir("codex", account) / "auth.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        row["status"] = "no_login"
+        return row
+    tokens = auth.get("tokens") if isinstance(auth, dict) else None
+    token = tokens.get("access_token") if isinstance(tokens, dict) else None
+    if not isinstance(token, str) or not token:
+        row["status"] = "no_login"
+        return row
+    exp = jwt_exp(token)
+    row["token"] = {"access_expires_at": exp}
+    if exp is not None and exp <= now:
+        row["status"] = "expired"
+        return row
+    headers = {"originator": "codex_cli_rs"}
+    if isinstance(tokens.get("account_id"), str):
+        headers["ChatGPT-Account-Id"] = tokens["account_id"]
+    code, body = http_json(codex_url(), token=token, headers=headers)
+    if code != 200 or not isinstance(body, dict):
+        row["status"] = status_name(code)
+        return row
+    row["status"] = "ok"
+    row.update(parse_codex_usage(body))
+    return row
+
+
+# ---------------------------------------------------------------- snapshot
+
+def estate_json(key: str):
+    root = os.environ["ESTATE_ROOT"]
+    p = subprocess.run([f"{root}/bin/estate", "config", "get", "--json", key],
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
+    if p.returncode != 0:
+        raise SystemExit(f"usage-poll: estate config get {key}: {p.stderr.strip()}")
+    return json.loads(p.stdout)
+
+
+def snapshot_path() -> Path:
+    return Path(os.environ["ESTATE_STATE"]) / "usage" / "snapshot.json"
+
+
+def read_snapshot(path=None):
+    try:
+        return json.loads((path or snapshot_path()).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def build_snapshot(harnesses: dict, settings: dict, previous, now: int) -> dict:
+    refresh = bool(settings.get("refresh_login", False))
+    prev = {(a.get("harness"), a.get("account")): a for a in (previous or {}).get("accounts", [])}
+    accounts = []
+    for harness in ("claude", "codex"):
+        for name in (harnesses.get(harness) or {}).get("accounts", []):
+            row = poll_claude(name, now, refresh) if harness == "claude" else poll_codex(name, now)
+            old = prev.get((harness, name))
+            if row["status"] == "ok":
+                row["limits_observed_at"] = now
+                row["stale"] = False
+            elif old and old.get("limits"):
+                # Keep the last good numbers, flagged stale, so readers still see headroom.
+                row["limits"] = old["limits"]
+                row["limits_observed_at"] = old.get("limits_observed_at")
+                row["stale"] = True
+                for k in ("plan", "limit_reached"):
+                    if k in old and k not in row:
+                        row[k] = old[k]
+            accounts.append(row)
+    return {"version": SNAPSHOT_VERSION, "observed_at": now,
+            "interval_seconds": int(settings.get("interval_seconds", 600)),
+            "host": os.environ.get("ESTATE_MACHINE", ""), "accounts": accounts}
+
+
+def cmd_poll() -> int:
+    now = int(time.time())
+    harnesses = estate_json("harnesses")
+    settings = estate_json("modules.usage")
+    snap = build_snapshot(harnesses, settings, read_snapshot(), now)
+    write_json_atomic(snapshot_path(), snap, mode=0o600)
+    bad = [f"{a['harness']}/{a['account']}: {a['status']}" for a in snap["accounts"]
+           if a["status"] != "ok"]
+    print(f"polled {len(snap['accounts'])} account(s)" + (f"; problems: {', '.join(bad)}" if bad else ""))
+    return 0
+
+
+def is_stale(snap: dict, now: int) -> bool:
+    return now - int(snap.get("observed_at", 0)) > 3 * int(snap.get("interval_seconds", 600))
+
+
+def fmt_reset(epoch, now):
+    if not epoch:
+        return "-"
+    t = dt.datetime.fromtimestamp(epoch)
+    return t.strftime("%H:%M") if 0 <= epoch - now < 20 * 3600 else t.strftime("%a %H:%M")
+
+
+def render_table(snap: dict, now: int) -> str:
+    age = max(0, now - int(snap.get("observed_at", now))) // 60
+    lines = [f"usage  ({age}m old{', STALE' if is_stale(snap, now) else ''})",
+             f"{'HARNESS':<8}{'ACCOUNT':<12}{'5H':>5}{'7D':>6}  {'OTHER':<20}{'RESETS 5H/7D':<20}STATE"]
+    for a in snap.get("accounts", []):
+        rows = a.get("limits") or []
+        by = {label(r): r for r in rows}
+        pct = lambda r: f"{int(r['percent'])}%" if r else "-"  # noqa: E731
+        other = " ".join(f"{k}:{int(r['percent'])}%" for k, r in by.items() if k not in ("5h", "7d"))
+        resets = f"{fmt_reset((by.get('5h') or {}).get('resets_at'), now)} / " \
+                 f"{fmt_reset((by.get('7d') or {}).get('resets_at'), now)}"
+        state = a["status"] + (" (stale numbers)" if a.get("stale") else "")
+        lines.append(f"{a['harness']:<8}{a['account']:<12}{pct(by.get('5h')):>5}{pct(by.get('7d')):>6}"
+                     f"  {other:<20}{resets:<20}{state}")
+    return "\n".join(lines)
+
+
+def cmd_show(as_json: bool) -> int:
+    snap = read_snapshot()
+    now = int(time.time())
+    if snap is None:
+        print(f"no usage snapshot at {snapshot_path()}; run: estate install usage", file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps(snap | {"stale": is_stale(snap, now)}, indent=1, sort_keys=True))
+    else:
+        print(render_table(snap, now))
+    return 0
+
+
+def cmd_status() -> int:
+    """For the doctor check: print one status line; exit 0 ok, 1 fail, 2 warn."""
+    snap = read_snapshot()
+    now = int(time.time())
+    if snap is None:
+        print(f"fail: no usage snapshot at {snapshot_path()} (the poll has not run or cannot write)")
+        return 1
+    age = max(0, now - int(snap.get("observed_at", 0)))
+    accounts = snap.get("accounts", [])
+    bad = [f"{a['harness']}/{a['account']} {a['status']}" for a in accounts if a["status"] != "ok"]
+    if is_stale(snap, now):
+        print(f"warn: snapshot is {age // 60}m old (older than 3 polls of "
+              f"{int(snap.get('interval_seconds', 600)) // 60}m); the timer may not be firing")
+        return 2
+    if bad:
+        print(f"warn: {'; '.join(bad)}")
+        return 2
+    print(f"ok: {len(accounts)} account(s) polled {age // 60}m ago")
+    return 0
+
+
+def main(argv) -> int:
+    for var in ("ESTATE_ROOT", "ESTATE_STATE"):
+        if not os.environ.get(var):
+            print(f"usage-poll: {var} is not set; run through the wrapper install writes", file=sys.stderr)
+            return 2
+    if argv[:1] == ["poll"]:
+        return cmd_poll()
+    if argv[:1] == ["status"]:
+        return cmd_status()
+    if argv[:1] == ["show"]:
+        return cmd_show("--json" in argv[1:])
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

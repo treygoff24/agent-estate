@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# rustc-gate: a RUSTC_WRAPPER that takes a machine-wide compile slot.
+#
+#   # ~/.cargo/config.toml (Cargo does not expand ~; write your home path)
+#   [build]
+#   rustc-wrapper = "/home/<you>/.local/bin/rustc-gate"
+#
+# At most RUSTC_GATE_SLOTS compiles run at once across every session and
+# worktree (see compile-slot-gate). RUSTC_GATE_SLOTS=0 bypasses the slots.
+# On macOS the compiler runs at nice 19, so compiles started outside testrun
+# also yield to your apps; every core stays available (never `taskpolicy -b`).
+# If sccache is installed the compile goes through it (RUSTC_GATE_SCCACHE=0
+# turns that off). COMPILE_SLOT_GATE overrides where the helper lives.
+set -u
+
+# `nice -n 19` is relative: from an already-niced parent it would land on 20, which
+# breaks tools that set their own low priority (EACCES). So raise to exactly 19.
+niced=()
+case "$OSTYPE" in
+  darwin*)
+    current="$(ps -o ni= -p $$ 2>/dev/null | tr -d ' ')"
+    case "$current" in ''|*[!0-9-]*) current=0 ;; esac
+    [ "$current" -lt 19 ] && niced=(nice -n "$((19 - current))")
+    ;;
+esac
+
+# sccache refuses every call when CARGO_INCREMENTAL=1 is set.
+if [ "${RUSTC_GATE_SCCACHE:-1}" != "0" ] && [ "${CARGO_INCREMENTAL:-}" != "1" ] \
+  && command -v sccache >/dev/null 2>&1; then
+  # sccache hashes CARGO_* variables into its key; a per-worktree target dir
+  # would stop worktrees sharing cache entries. rustc does not read these.
+  unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_BUILD_DIR
+  set -- sccache "$@"
+fi
+
+set -- ${niced[@]+"${niced[@]}"} "$@"
+
+if [ "${RUSTC_GATE_SLOTS:-}" = "0" ]; then exec "$@"; fi
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+helper="${COMPILE_SLOT_GATE:-$here/compile-slot-gate}"
+[ -x "$helper" ] || { echo "rustc-gate: missing $helper; run: estate install guardrails" >&2; exit 2; }
+exec "$helper" rustc -- "$@"

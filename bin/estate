@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""estate: the single entry point for agent-estate. Run `estate --help`."""
+import os
+import sys
+
+if sys.version_info < (3, 11):
+    sys.exit(f"estate: needs Python 3.11 or newer; {sys.executable} is "
+             f"{sys.version.split()[0]}. On macOS: brew install python. "
+             f"On Debian/Ubuntu: apt install python3 (Debian 12 and Ubuntu 24.04 ship 3.11+).")
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+
+from estate.cli import main  # noqa: E402
+
+sys.exit(main())

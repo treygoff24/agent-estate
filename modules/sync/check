@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Doctor check: exit 0 ok, 1 fail, 2 warn; first line is the status.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+msg="$(valid_settings)" || fail "$msg" "$DONE_WHEN"
+fix="run: estate install sync"
+if [ "$ESTATE_PLATFORM" = mac ]; then
+  [ -f "$PLIST" ] || fail "not installed: $PLIST is missing ($fix)" "$DONE_WHEN"
+  estate render "$ESTATE_MODULE_DIR/templates/sync.plist" | cmp -s - "$PLIST" \
+    || fail "$PLIST does not match estate.toml ($fix)" "$DONE_WHEN"
+  launchctl list "$LABEL" >/dev/null 2>&1 || fail "$LABEL is not loaded in launchd ($fix)" "$DONE_WHEN"
+else
+  for pair in "sync.service:$SERVICE" "sync.timer:$TIMER_FILE"; do
+    tpl="${pair%%:*}" dest="${pair#*:}"
+    [ -f "$dest" ] || fail "not installed: $dest is missing ($fix)" "$DONE_WHEN"
+    estate render "$ESTATE_MODULE_DIR/templates/$tpl" | cmp -s - "$dest" \
+      || fail "$dest does not match estate.toml ($fix)" "$DONE_WHEN"
+  done
+  systemctl --user is-enabled --quiet "$TIMER" || fail "$TIMER is not enabled ($fix)" "$DONE_WHEN"
+  systemctl --user is-active --quiet "$TIMER" || fail "$TIMER is not active ($fix)" "$DONE_WHEN"
+fi
+[ -x "$SYNC_BIN" ] || fail "$SYNC_BIN is missing ($fix)" "$DONE_WHEN"
+rc=0
+line="$("$ESTATE_MODULE_DIR/estate-sync" --status)" || rc=$?
+case "$rc" in
+  0) ok "daily at $WHEN; ${line#ok: }" "$DONE_WHEN" ;;
+  2) warn "${line#warn: }" "repos skipped by the sync are fixed by hand (commit, push or merge them) and the next run finishes clean" ;;
+  *) fail "${line#fail: }" "$DONE_WHEN" ;;
+esac

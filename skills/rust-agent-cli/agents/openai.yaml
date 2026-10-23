@@ -1,0 +1,6 @@
+interface:
+  display_name: "Rust Agent CLI"
+  short_description: "Build high-quality Rust CLIs with Clap for AI agents."
+  default_prompt: "Use rust-agent-cli to design and implement a deterministic Rust Clap CLI for AI agents."
+policy:
+  allow_implicit_invocation: true

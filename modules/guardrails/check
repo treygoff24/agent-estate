@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Doctor check: exit 0 ok, 1 fail, 2 warn; first line is the status.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+msg="$(valid_settings)" || fail "$msg" "$DONE_WHEN"
+fix="run: estate install guardrails"
+for tool in "${TOOLS[@]}"; do
+  [ -f "$BIN/$tool" ] || fail "not installed: $BIN/$tool is missing ($fix)" "$DONE_WHEN"
+  [ -x "$BIN/$tool" ] || fail "$BIN/$tool is not executable ($fix)" "$DONE_WHEN"
+  cmp -s "$ESTATE_MODULE_DIR/bin/$tool" "$BIN/$tool" || fail "$BIN/$tool is out of date with the repo ($fix)" "$DONE_WHEN"
+done
+{ [ -f "$CONF_JSON" ] && conf_json | cmp -s - "$CONF_JSON"; } || fail "$CONF_JSON is missing or does not match estate.toml ($fix)" "$DONE_WHEN"
+if [ "$ESTATE_PLATFORM" = linux ]; then
+  [ -f "$SLICE_FILE" ] || fail "not installed: $SLICE_FILE is missing ($fix)" "$DONE_WHEN"
+  estate render "$ESTATE_MODULE_DIR/templates/slice.conf" | cmp -s - "$SLICE_FILE" \
+    || fail "$SLICE_FILE does not match estate.toml ($fix)" "$DONE_WHEN"
+fi
+
+# The hook must be in each configured harness's settings. A missing entry is a warning:
+# everything else works without it, but the footgun refusals do nothing.
+missing=()
+has_hook() { [ -f "$1" ] && grep -q 'footgun-hook' "$1"; }
+if cfg harnesses.claude >/dev/null 2>&1; then
+  has_hook "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" || missing+=("claude (settings.json)")
+fi
+if cfg harnesses.codex >/dev/null 2>&1; then
+  has_hook "${CODEX_HOME:-$HOME/.codex}/hooks.json" || has_hook "${CODEX_HOME:-$HOME/.codex}/config.toml" || missing+=("codex (hooks.json)")
+fi
+if [ "${#missing[@]}" -gt 0 ]; then
+  warn "footgun hook is not in the settings of: ${missing[*]}" \
+       "settings/claude.json (or settings/codex-hooks.json) from this module is merged into each harness's settings"
+fi
+extra=""
+[ "$COMPILE_SLOTS" = true ] && extra=" and the compile slots"
+ok "testrun, the footgun hook$extra are installed and in your harness settings" "$DONE_WHEN"

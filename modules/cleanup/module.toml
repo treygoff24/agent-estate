@@ -1,0 +1,20 @@
+name = "cleanup"
+description = "Six-hourly cleanup of age-gated agent scratch (worktrees, build caches, logs) plus an orphan-process report"
+platforms = ["mac", "linux"]
+requires = []
+
+[prerequisites]
+all = ["python3", "git"]
+linux = ["systemctl"]
+mac = ["launchctl"]
+
+# Every setting this module reads, with its default. Override in estate.toml
+# under [modules.cleanup]; an unlisted key is an error. Ages are Ns, Nm, Nh, Nd or Nw.
+[defaults]
+worktree_age = "7d"     # clean scratch worktrees untouched this long are removed
+cache_age = "30d"       # target/ and node_modules/ with nothing modified this long are removed
+log_age = "30d"         # *.log files under the state dir and log_dirs
+events_age = "90d"      # this module's own event files
+log_dirs = []           # extra directories whose *.log files age out, e.g. ["~/.cache/my-tool"]
+orphan_hours = 6        # a parentless process must be this old to be reported
+orphan_cpu = 80         # ... or this busy (average % of a core) to be reported for CPU

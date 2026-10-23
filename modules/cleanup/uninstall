@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Remove the six-hourly job and the estate-cleanup link. Keeps the report history under the state dir.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+if [ "$ESTATE_PLATFORM" = mac ]; then
+  run launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+  run rm -f -- "$PLIST"
+else
+  run systemctl --user disable --now "$TIMER" 2>/dev/null || true
+  run rm -f -- "$SERVICE" "$TIMER_FILE"
+  run systemctl --user daemon-reload
+fi
+if [ "$(readlink "$BIN/estate-cleanup" 2>/dev/null)" = "$ESTATE_MODULE_DIR/estate-cleanup" ]; then
+  run rm -f -- "$BIN/estate-cleanup"
+fi
+say "removed the six-hourly cleanup job (events under $STATE are kept)"

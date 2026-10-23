@@ -1,0 +1,13 @@
+name = "tmp-cleanup"
+description = "Age out agent scratch under /tmp (Linux: systemd-tmpfiles user drop-in; macOS: nothing to do)"
+platforms = ["mac", "linux"]
+requires = []
+
+[prerequisites]
+linux = ["systemctl", "systemd-tmpfiles"]
+
+# Every setting this module reads, with its default. Override any of them
+# in estate.toml under [modules.tmp-cleanup]; an unlisted key is an error.
+[defaults]
+path = "/tmp"   # directory to age; only files this login owns can be removed
+age = "1d"      # systemd-tmpfiles age: s, m, h, d or w, e.g. 12h, 1d, 2w

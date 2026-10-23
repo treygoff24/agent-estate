@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Doctor check: exit 0 ok, 1 fail, 2 warn; first line is the status.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+msg="$(valid_settings)" || fail "$msg" "$DONE_WHEN"
+fix="run: estate install skills"
+HERD="$BIN/skillherd"
+[ -x "$HERD" ] || HERD="$(command -v skillherd || true)"
+[ -n "$HERD" ] || fail "skillherd is not on PATH ($fix; is $BIN on PATH?)" "$DONE_WHEN"
+if [ -z "$REMOTE" ]; then
+  [ -d "$POOL" ] || fail "the skill pool $POOL does not exist ($fix)" "$DONE_WHEN"
+else
+  [ -d "$POOL" ] || fail "the pool $POOL is not cloned yet (run: skillherd sync)" "$DONE_WHEN"
+fi
+rc=0
+"$HERD" --pool "$POOL" doctor >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 0 ] || warn "skillherd doctor has findings (exit $rc; run: skillherd doctor)" "$DONE_WHEN"
+hooks="$(cfg modules.sync.hooks 2>/dev/null || true)"
+if printf '%s\n' "$hooks" | grep -qx "$OLD_HOOK_LINE"; then
+  warn "the nightly sync still runs \"$OLD_HOOK_LINE\", the tool's old name: replace it with \"$HOOK_LINE\" in hooks under [modules.sync] in estate.toml" "$DONE_WHEN"
+fi
+if ! printf '%s\n' "$hooks" | grep -qx "$HOOK_LINE"; then
+  warn "the nightly sync does not render the pool: add \"$HOOK_LINE\" to hooks under [modules.sync] in estate.toml" "$DONE_WHEN"
+fi
+ok "skillherd and pool $POOL are healthy, rendered nightly" "$DONE_WHEN"

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Doctor check: exit 0 ok, 1 fail, 2 warn; first line is the status.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+[ -x "$BIN/$TOOL_NAME" ] || fail "$BIN/$TOOL_NAME is missing (run: estate install config-sync)" \
+  "every file in the agent-env manifest is installed under your home and the last apply succeeded"
+exec python3 "$TOOL" check --repo "$REPO"

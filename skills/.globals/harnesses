@@ -1,0 +1,7 @@
+# .globals/harnesses: the surfaces the renderer owns and the roots each harness loads.
+# Columns: harness  tier  surface  variant-key  reads. `{name}` expands to the skill CLI's
+# resolved path (`skillherd schema` lists them). Tier `none` = managed entries removed, nothing served.
+# Add a row for another harness (pi, cursor, grok) only when you use it.
+
+claude   main  {claude_shared}/skills   claude   surface
+codex    main  {codex_home}/skills      codex    surface,agents_dir

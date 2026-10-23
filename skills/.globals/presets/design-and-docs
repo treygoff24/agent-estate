@@ -1,0 +1,10 @@
+# design-and-docs: architecture work and the prose around it.
+# Install: cd <repo> && skill add @design-and-docs
+
+domain-modeling
+codebase-design
+codebase-mapping
+improve-codebase-architecture
+wayfinder
+writing
+writing-for-agents

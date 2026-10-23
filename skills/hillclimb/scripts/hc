@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""hc: measuring harness for a hill-climb (hillclimb skill). Stdlib only.
+
+A climb lives in <root>/.hillclimb/<name>/: state.json (config + harness lock),
+runs/<label>.jsonl (one row per rep), runs/<label>.meta.json (fingerprint +
+guard), runs/<label>.log (command output), journal.md (the human record).
+
+  hc init NAME --cmd CMD --metric KEY --direction lower|higher
+          [--min-effect 2%|0.5] [--guard CMD] [--holdout CMD]
+          [--harness PATH ...] [--reps 5] [--warmup 1] [--root DIR]
+  hc approve                 record the harness hash (lock)
+  hc run LABEL [--dir D] [--reps N] [--holdout] [--append] [--no-guard]
+  hc ab LABEL_A LABEL_B --a DIR_A --b DIR_B [--reps N] [--holdout]
+          [--append] [--guard-a] [--no-guard]
+  hc compare A B [--json]    verdict for B against A; exit 0 only when B is
+                             better past the noise and the minimum effect
+  hc status
+
+Metric: KEY "wall_s" is the command's wall time, measured by hc. Any other KEY
+is read from the last stdout line of CMD, which must then be a JSON object
+({"p95_ms": 41.2, ...}). Either way, every numeric key in a last-line JSON
+object is recorded and shown by compare (e.g. a test count beside wall_s).
+A rep whose command exits non-zero is a failed rep, never a value.
+Commands run under bash -c in the measured directory, with HC_LABEL and
+HC_REP set. The guard runs once per label after its reps; hc ab guards
+only B unless --guard-a (A is the already-kept state). A --harness PATH may
+be a directory: every file under it is hashed. Each rep prints a progress
+line to stderr. Any subcommand takes --flow DIR to pick the climb (default:
+the one .hillclimb/*/ found from the cwd upward).
+Exit codes: compare 0 = BETTER, 1 = any other verdict; 2 usage error;
+3 harness lock missing or changed (run and ab only).
+"""
+import re
+import argparse, datetime, hashlib, json, math, os, platform, random, socket
+import statistics, subprocess, sys, time
+from pathlib import Path
+
+SELF = Path(__file__).resolve()
+
+
+def die(msg, code=2):
+    print(f"hc: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------- flow + state ----------
+
+def find_flow(arg):
+    if arg:
+        p = Path(arg).resolve()
+        if not (p / "state.json").is_file():
+            die(f"no state.json in {p}")
+        return p
+    here = Path.cwd().resolve()
+    for d in [here, *here.parents]:
+        hits = sorted((d / ".hillclimb").glob("*/state.json")) if (d / ".hillclimb").is_dir() else []
+        if len(hits) == 1:
+            return hits[0].parent
+        if len(hits) > 1:
+            die("several climbs here; pass --flow: " + ", ".join(str(h.parent) for h in hits))
+    die("no climb found (run hc init first, or pass --flow)")
+
+
+def load_state(flow):
+    return json.loads((flow / "state.json").read_text())
+
+
+def save_state(flow, st):
+    tmp = flow / "state.json.tmp"
+    tmp.write_text(json.dumps(st, indent=2) + "\n")
+    tmp.replace(flow / "state.json")
+
+
+def parse_effect(s):
+    if s is None:
+        return None
+    s = s.strip()
+    if s.endswith("%"):
+        return ("ratio", float(s[:-1]) / 100)
+    return ("diff", float(s))
+
+
+# ---------- harness lock ----------
+
+def harness_digest(st, root=None):
+    root = Path(root or st["root"])
+    files = {}
+    for rel in st.get("harness_paths", []):
+        p = root / rel
+        if p.is_dir():
+            h = hashlib.sha256()
+            for f in sorted(x for x in p.rglob("*") if x.is_file()
+                            and not {".git", "__pycache__", "node_modules"} & set(x.relative_to(p).parts)):
+                h.update(str(f.relative_to(p)).encode() + b"\0" + f.read_bytes() + b"\0")
+            files[rel + "/"] = h.hexdigest()
+        else:
+            files[rel] = hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "MISSING"
+    files["<hc runner>"] = hashlib.sha256(SELF.read_bytes()).hexdigest()
+    cmds = json.dumps([st.get("cmd"), st.get("guard_cmd"), st.get("holdout_cmd"),
+                       st.get("metric"), st.get("direction")])
+    files["<commands>"] = hashlib.sha256(cmds.encode()).hexdigest()
+    return files
+
+
+def check_harness(st, dirs=()):
+    locked = st.get("harness_files")
+    if not locked:
+        die("harness not approved yet: review the metric command and harness files, then run hc approve", 3)
+    changed = []
+    for d in [st["root"], *dirs]:
+        now = harness_digest(st, d)
+        changed += [f"{k} in {d}" for k in sorted(set(locked) | set(now)) if locked.get(k) != now.get(k)]
+    if changed:
+        die("harness changed since approval: " + ", ".join(dict.fromkeys(changed)) +
+            ". Numbers from a changed harness are not comparable to earlier ones. Show the change "
+            "to the person who owns the climb; after their OK, hc approve and re-measure the kept baseline.", 3)
+
+
+# ---------- fingerprint ----------
+
+def git(dirp, *args):
+    try:
+        r = subprocess.run(["git", "-C", str(dirp), *args], capture_output=True, text=True, timeout=30)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def fingerprint(dirp):
+    head = git(dirp, "rev-parse", "HEAD")
+    diff = git(dirp, "diff", "HEAD") if head else None
+    status = git(dirp, "status", "--porcelain", "--untracked-files=no") if head else None
+    try:
+        load1 = os.getloadavg()[0]
+    except OSError:
+        load1 = None
+    return {
+        "dir": str(dirp), "git_head": head,
+        "dirty": bool(status) if status is not None else None,
+        "diff_sha": hashlib.sha256(diff.encode()).hexdigest()[:16] if diff else None,
+        "host": socket.gethostname(), "platform": platform.platform(),
+        "cpus": os.cpu_count(), "load1": load1,
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+def warn_load(fp):
+    if fp["load1"] is not None and fp["cpus"] and fp["load1"] > 0.5 * fp["cpus"]:
+        print(f"hc: warning: load average {fp['load1']:.1f} on {fp['cpus']} cpus in {fp['dir']}; "
+              "other work on this machine will widen the noise", file=sys.stderr)
+
+
+# ---------- running ----------
+
+def run_once(cmd, dirp, label, rep, metric, logf):
+    env = dict(os.environ, HC_LABEL=label, HC_REP=str(rep))
+    t0 = time.perf_counter()
+    r = subprocess.run(["bash", "-c", cmd], cwd=dirp, env=env, capture_output=True, text=True)
+    wall = time.perf_counter() - t0
+    logf.write(f"=== {label} rep {rep} exit {r.returncode} wall {wall:.3f}s\n{r.stdout}{r.stderr}\n")
+    logf.flush()
+    print(f"hc: {label} rep {rep} exit {r.returncode} {wall:.3f}s", file=sys.stderr, flush=True)
+    row = {"label": label, "rep": rep, "exit": r.returncode, "wall_s": round(wall, 6),
+           "ts": time.time(), "metrics": {"wall_s": round(wall, 6)}}
+    if r.returncode != 0:
+        row["status"] = "fail"
+        return row
+    lines = [l for l in r.stdout.strip().splitlines() if l.strip()]
+    try:
+        obj = json.loads(lines[-1]) if lines else None
+    except json.JSONDecodeError:
+        obj = None
+    if metric != "wall_s" and (not isinstance(obj, dict) or not isinstance(obj.get(metric), (int, float))):
+        row["status"] = "fail"
+        row["error"] = f"last stdout line is not a JSON object with numeric '{metric}'"
+        return row
+    if isinstance(obj, dict):  # extra numbers ride along; hc's own wall_s always wins
+        row["metrics"].update({k: v for k, v in obj.items()
+                               if isinstance(v, (int, float)) and not isinstance(v, bool) and k != "wall_s"})
+    row["value"] = row["metrics"][metric]
+    row["status"] = "ok"
+    return row
+
+
+LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+class Variant:
+    def __init__(self, flow, st, label, dirp, holdout, append):
+        if not LABEL_RE.match(label):
+            die(f"label '{label}': use letters, digits, '.', '_' or '-' (max 64)")
+        self.label, self.dir, self.holdout = label, Path(dirp).resolve(), holdout
+        if not self.dir.is_dir():
+            die(f"not a directory: {self.dir}")
+        self.cmd = st["holdout_cmd"] if holdout else st["cmd"]
+        if holdout and not self.cmd:
+            die("no holdout command set (hc init --holdout)")
+        runs = flow / "runs"
+        runs.mkdir(exist_ok=True)
+        self.rows_p = runs / f"{label}.jsonl"
+        self.meta_p = runs / f"{label}.meta.json"
+        if self.rows_p.exists() and not append:
+            die(f"label '{label}' already measured; pick a new label, or --append to add reps")
+        if append and self.meta_p.exists():
+            old = json.loads(self.meta_p.read_text())
+            if old.get("holdout", False) != holdout:
+                die(f"label '{label}' was measured {'with' if old.get('holdout') else 'without'} --holdout")
+        self.start_rep = sum(1 for _ in self.rows_p.open()) if self.rows_p.exists() else 0
+        self.log = (runs / f"{label}.log").open("a")
+        self.fp = fingerprint(self.dir)
+        warn_load(self.fp)
+
+    def record(self, row, ab_id=None, pair=None):
+        if ab_id:
+            row["ab_id"], row["pair"] = ab_id, pair
+        with self.rows_p.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+
+    def finish(self, st, guard):
+        g = None
+        if guard and st.get("guard_cmd"):
+            r = subprocess.run(["bash", "-c", st["guard_cmd"]], cwd=self.dir, capture_output=True, text=True)
+            self.log.write(f"=== {self.label} guard exit {r.returncode}\n{r.stdout}{r.stderr}\n")
+            g = {"cmd": st["guard_cmd"], "exit": r.returncode, "pass": r.returncode == 0}
+        meta = {"label": self.label, "holdout": self.holdout, "fingerprint": self.fp, "guard": g}
+        self.meta_p.write_text(json.dumps(meta, indent=2) + "\n")
+        self.log.close()
+        return g
+
+
+def summarize(label, rows, guard):
+    ok = [r["value"] for r in rows if r["status"] == "ok"]
+    fail = sum(1 for r in rows if r["status"] != "ok")
+    s = f"{label}: n={len(ok)}"
+    if ok:
+        s += f" median={statistics.median(ok):.6g} min={min(ok):.6g} max={max(ok):.6g}"
+    if fail:
+        s += f" FAILED_REPS={fail}"
+    if guard:
+        s += " guard=" + ("pass" if guard["pass"] else f"FAIL(exit {guard['exit']})")
+    print(s)
+
+
+def cmd_run(a):
+    flow = find_flow(a.flow); st = load_state(flow)
+    check_harness(st, [Path(a.dir).resolve()] if a.dir else [])
+    v = Variant(flow, st, a.label, a.dir or st["root"], a.holdout, a.append)
+    reps = a.reps or st["reps"]
+    for w in range(st["warmup"] if not a.append else 0):
+        run_once(v.cmd, v.dir, v.label, f"warmup{w}", st["metric"], v.log)
+    rows = []
+    for k in range(v.start_rep, v.start_rep + reps):
+        row = run_once(v.cmd, v.dir, v.label, k, st["metric"], v.log)
+        v.record(row); rows.append(row)
+    g = v.finish(st, guard=not a.no_guard)
+    summarize(v.label, rows, g)
+
+
+def cmd_ab(a):
+    flow = find_flow(a.flow); st = load_state(flow)
+    check_harness(st, [Path(a.a).resolve(), Path(a.b).resolve()])
+    if a.label_a == a.label_b:
+        die("the two labels must differ")
+    va = Variant(flow, st, a.label_a, a.a, a.holdout, a.append)
+    vb = Variant(flow, st, a.label_b, a.b, a.holdout, a.append)
+    reps = a.reps or st["reps"]
+    ab_id = f"{int(time.time())}-{os.getpid()}"
+    if not a.append:
+        for w in range(st["warmup"]):
+            run_once(va.cmd, va.dir, va.label, f"warmup{w}", st["metric"], va.log)
+            run_once(vb.cmd, vb.dir, vb.label, f"warmup{w}", st["metric"], vb.log)
+    ra, rb = [], []
+    for i in range(reps):
+        order = [(va, ra, va.start_rep + i), (vb, rb, vb.start_rep + i)]
+        if i % 2:
+            order.reverse()  # ABBA: cancels drift that grows through the run
+        for v, acc, k in order:
+            row = run_once(v.cmd, v.dir, v.label, k, st["metric"], v.log)
+            v.record(row, ab_id, i); acc.append(row)
+    ga = va.finish(st, guard=a.guard_a and not a.no_guard); gb = vb.finish(st, guard=not a.no_guard)
+    summarize(va.label, ra, ga); summarize(vb.label, rb, gb)
+    print(f"next: hc compare {va.label} {vb.label}")
+
+
+# ---------- statistics ----------
+
+def load_label(flow, label):
+    p = flow / "runs" / f"{label}.jsonl"
+    if not p.exists():
+        die(f"no measurements for label '{label}'")
+    rows = [json.loads(l) for l in p.open() if l.strip()]
+    mp = flow / "runs" / f"{label}.meta.json"
+    meta = json.loads(mp.read_text()) if mp.exists() else {}
+    return rows, meta
+
+
+def percentile(sorted_xs, q):
+    i = q * (len(sorted_xs) - 1)
+    lo, hi = math.floor(i), math.ceil(i)
+    return sorted_xs[lo] + (sorted_xs[hi] - sorted_xs[lo]) * (i - lo)
+
+
+def compare(flow, st, la, lb):
+    rows_a, meta_a = load_label(flow, la)
+    rows_b, meta_b = load_label(flow, lb)
+    if meta_a.get("holdout", False) != meta_b.get("holdout", False):
+        die("one label is a holdout measurement and the other is not; compare like with like")
+    okA = [r for r in rows_a if r["status"] == "ok"]
+    okB = [r for r in rows_b if r["status"] == "ok"]
+    notes = []
+    fails_b = len(rows_b) - len(okB)
+    if len(rows_a) - len(okA):
+        notes.append(f"{la} has {len(rows_a) - len(okA)} failed rep(s)")
+    if fails_b:
+        notes.append(f"{lb} has {fails_b} failed rep(s)")
+    if len(okA) < 2:
+        die(f"need at least 2 successful reps of '{la}'")
+    if len(okB) < 2:
+        return {"a": la, "b": lb, "metric": st["metric"], "direction": st["direction"],
+                "mode": "none", "median_a": statistics.median([r["value"] for r in okA]),
+                "median_b": None, "n_a": len(okA), "n_b": len(okB), "change": None, "ci95": None,
+                "ci_halfwidth": None, "min_effect": st.get("min_effect"),
+                "verdict": "FAILED REPS", "notes": notes}
+    vals = [r["value"] for r in okA + okB]
+    eff = parse_effect(st.get("min_effect"))
+    scale = "ratio" if all(v > 0 for v in vals) else "diff"
+    if eff and eff[0] == "ratio" and scale == "diff":
+        die("min effect is a percent but some values are <= 0; set an absolute --min-effect")
+    if eff and eff[0] == "diff":
+        scale = "diff"
+    f = (lambda b, a: math.log(b / a)) if scale == "ratio" else (lambda b, a: b - a)
+
+    pa = {(r.get("ab_id"), r.get("pair")): r["value"] for r in okA if r.get("ab_id")}
+    pb = {(r.get("ab_id"), r.get("pair")): r["value"] for r in okB if r.get("ab_id")}
+    keys = sorted(set(pa) & set(pb), key=str)
+    rng = random.Random(0)
+    B = 10000
+    if len(keys) >= 3:
+        mode = f"paired ({len(keys)} interleaved pairs)"
+        d = [f(pb[k], pa[k]) for k in keys]
+        point = statistics.median(d)
+        boots = sorted(statistics.median(rng.choices(d, k=len(d))) for _ in range(B))
+    else:
+        mode = "unpaired (measured at different times; drift between them counts as effect)"
+        xa, xb = [r["value"] for r in okA], [r["value"] for r in okB]
+        point = f(statistics.median(xb), statistics.median(xa))
+        boots = sorted(f(statistics.median(rng.choices(xb, k=len(xb))),
+                         statistics.median(rng.choices(xa, k=len(xa)))) for _ in range(B))
+        fa, fb = meta_a.get("fingerprint", {}), meta_b.get("fingerprint", {})
+        if fa.get("host") and fa.get("host") != fb.get("host"):
+            notes.append(f"measured on different hosts ({fa.get('host')} vs {fb.get('host')})")
+        ta, tb = fa.get("ts"), fb.get("ts")
+        if ta and tb:
+            gap = abs((datetime.datetime.fromisoformat(tb) - datetime.datetime.fromisoformat(ta)).total_seconds())
+            if gap > 3600:
+                notes.append(f"measured {gap / 3600:.1f} h apart; re-measure both with hc ab before keeping")
+    lo, hi = percentile(boots, 0.025), percentile(boots, 0.975)
+    better_sign = -1 if st["direction"] == "lower" else 1
+
+    def show(x):
+        return f"{(math.exp(x) - 1) * 100:+.2f}%" if scale == "ratio" else f"{x:+.6g}"
+
+    effect_size = abs(math.exp(point) - 1) if scale == "ratio" else abs(point)
+    ci_better = (hi < 0) if better_sign < 0 else (lo > 0)
+    ci_worse = (lo > 0) if better_sign < 0 else (hi < 0)
+    guard_b = meta_b.get("guard")
+    if guard_b and not guard_b.get("pass"):
+        verdict = "GUARD FAILED"
+    elif fails_b:
+        verdict = "FAILED REPS"
+    elif ci_better and eff and effect_size < eff[1]:
+        verdict = "BETTER, BELOW MIN EFFECT"
+    elif ci_better:
+        verdict = "BETTER"
+    elif ci_worse:
+        verdict = "WORSE"
+    else:
+        verdict = "WITHIN NOISE"
+    half = (hi - lo) / 2
+    others = {}
+    keys_all = sorted({k for r in okA + okB for k in r.get("metrics", {})} - {st["metric"]})
+    for k in keys_all:
+        va_ = [r["metrics"][k] for r in okA if k in r.get("metrics", {})]
+        vb_ = [r["metrics"][k] for r in okB if k in r.get("metrics", {})]
+        if va_ and vb_:
+            others[k] = [statistics.median(va_), statistics.median(vb_)]
+    out = {
+        "a": la, "b": lb, "metric": st["metric"], "direction": st["direction"], "mode": mode,
+        "median_a": statistics.median([r["value"] for r in okA]),
+        "median_b": statistics.median([r["value"] for r in okB]),
+        "n_a": len(okA), "n_b": len(okB), "change": show(point),
+        "ci95": [show(lo), show(hi)],
+        "ci_halfwidth": (f"{(math.exp(half) - 1) * 100:.2f}%" if scale == "ratio" else f"{half:.6g}"),
+        "min_effect": st.get("min_effect"), "verdict": verdict, "notes": notes,
+        "other_metrics_median_a_b": others,
+    }
+    if min(len(okA), len(okB)) < 5:
+        out["notes"].append("fewer than 5 reps on a side; the interval is rough")
+    return out
+
+
+def cmd_compare(a):
+    flow = find_flow(a.flow); st = load_state(flow)
+    out = compare(flow, st, a.a, a.b)
+    if a.json:
+        print(json.dumps(out, indent=2))
+    else:
+        print(f"{out['metric']} ({out['direction']} is better), {out['mode']}")
+        print(f"  {out['a']}: median {out['median_a']:.6g} (n={out['n_a']})")
+        if out["median_b"] is not None:
+            print(f"  {out['b']}: median {out['median_b']:.6g} (n={out['n_b']})")
+        else:
+            print(f"  {out['b']}: fewer than 2 successful reps; read runs/{out['b']}.log")
+        if out["change"] is not None:
+            print(f"  change {out['change']}  95% CI [{out['ci95'][0]}, {out['ci95'][1]}]  "
+                  f"half-width {out['ci_halfwidth']}  min effect {out['min_effect']}")
+        for k, (ma, mb) in (out.get("other_metrics_median_a_b") or {}).items():
+            print(f"  also {k}: {ma:.6g} -> {mb:.6g}")
+        print(f"  verdict: {out['verdict']}")
+        for n in out["notes"]:
+            print(f"  note: {n}")
+    sys.exit(0 if out["verdict"] == "BETTER" else 1)
+
+
+# ---------- init / approve / status ----------
+
+JOURNAL = """# Hill-climb: {name}
+
+## Brief
+<The goal in the requester's words; who and what the number stands for.>
+
+## Setup
+- Target: `{metric}`, {direction} is better. Minimum effect worth keeping: {min_effect}.
+- Metric command: `{cmd}`
+- Guardrail: `{guard}`
+- Held-out check: `{holdout}`
+- Scope (may change) / off-limits:
+- Stopping rule and budget:
+
+## Baseline and noise floor
+
+## Rounds
+<!-- One entry per round, kept or reverted. -->
+
+## Considered, not pursued
+
+## Result
+"""
+
+
+def cmd_init(a):
+    root = Path(a.root or Path.cwd()).resolve()
+    flow = root / ".hillclimb" / a.name
+    if (flow / "state.json").exists():
+        die(f"climb '{a.name}' already exists at {flow}")
+    eff = parse_effect(a.min_effect)
+    for rel in a.harness:
+        if not (root / rel).exists():
+            die(f"harness path not found (paths are relative to {root}): {rel}")
+    flow.mkdir(parents=True)
+    (flow / "runs").mkdir()
+    st = {"name": a.name, "root": str(root), "cmd": a.cmd, "metric": a.metric,
+          "direction": a.direction, "min_effect": a.min_effect, "guard_cmd": a.guard,
+          "holdout_cmd": a.holdout, "reps": a.reps, "warmup": a.warmup,
+          "harness_paths": a.harness, "created": fingerprint(root)["ts"]}
+    save_state(flow, st)
+    (flow / "journal.md").write_text(JOURNAL.format(
+        name=a.name, metric=a.metric, direction=a.direction, min_effect=a.min_effect or "unset",
+        cmd=a.cmd, guard=a.guard or "none", holdout=a.holdout or "none"))
+    gi = root / ".hillclimb" / ".gitignore"
+    if not gi.exists():
+        gi.write_text("*/runs/\n")
+    print(f"created {flow}\nnext: review the harness, then hc approve")
+    if eff is None:
+        print("hc: note: no --min-effect; every change that clears the noise will read as BETTER", file=sys.stderr)
+
+
+def cmd_approve(a):
+    flow = find_flow(a.flow); st = load_state(flow)
+    old = st.get("harness_files") or {}
+    st["harness_files"] = harness_digest(st)
+    st["approved"] = fingerprint(Path(st["root"]))["ts"]
+    save_state(flow, st)
+    changed = sorted(k for k in st["harness_files"] if old and old.get(k) != st["harness_files"][k])
+    print("harness locked over: " + ", ".join(st["harness_files"]))
+    if changed:
+        print("re-approved after changes to: " + ", ".join(changed) +
+              "; earlier numbers are not comparable, re-measure the kept baseline")
+
+
+def cmd_status(a):
+    flow = find_flow(a.flow); st = load_state(flow)
+    print(f"{st['name']}: {st['metric']} ({st['direction']} is better), min effect {st.get('min_effect')}")
+    print(f"flow: {flow}")
+    try:
+        check_harness(st); print("harness: locked, unchanged")
+    except SystemExit:
+        print("harness: NOT APPROVED OR CHANGED (hc run will refuse)")
+    for p in sorted((flow / "runs").glob("*.jsonl"), key=lambda p: p.stat().st_mtime):
+        rows, meta = load_label(flow, p.stem)
+        ok = [r["value"] for r in rows if r["status"] == "ok"]
+        fp = meta.get("fingerprint", {})
+        g = meta.get("guard")
+        print(f"  {p.stem:<24} n={len(ok):<3} median={statistics.median(ok) if ok else float('nan'):<12.6g} "
+              f"fail={len(rows) - len(ok)} guard={'-' if not g else ('pass' if g['pass'] else 'FAIL')} "
+              f"{'holdout ' if meta.get('holdout') else ''}head={(fp.get('git_head') or '-')[:9]}"
+              f"{('+dirty:' + (fp.get('diff_sha') or '?')) if fp.get('dirty') else ''} {fp.get('ts', '')}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="hc", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--flow")
+    sub = ap.add_subparsers(dest="sub", required=True)
+    p = sub.add_parser("init"); p.add_argument("name"); p.add_argument("--cmd", required=True)
+    p.add_argument("--metric", required=True); p.add_argument("--direction", required=True, choices=["lower", "higher"])
+    p.add_argument("--min-effect"); p.add_argument("--guard"); p.add_argument("--holdout")
+    p.add_argument("--harness", nargs="*", default=[]); p.add_argument("--reps", type=int, default=5)
+    p.add_argument("--warmup", type=int, default=1); p.add_argument("--root"); p.set_defaults(fn=cmd_init)
+    p = sub.add_parser("approve"); p.set_defaults(fn=cmd_approve)
+    p = sub.add_parser("run"); p.add_argument("label"); p.add_argument("--dir"); p.add_argument("--reps", type=int)
+    p.add_argument("--holdout", action="store_true"); p.add_argument("--append", action="store_true")
+    p.add_argument("--no-guard", action="store_true"); p.set_defaults(fn=cmd_run)
+    p = sub.add_parser("ab"); p.add_argument("label_a"); p.add_argument("label_b")
+    p.add_argument("--a", required=True); p.add_argument("--b", required=True); p.add_argument("--reps", type=int)
+    p.add_argument("--holdout", action="store_true"); p.add_argument("--append", action="store_true")
+    p.add_argument("--no-guard", action="store_true"); p.add_argument("--guard-a", action="store_true")
+    p.set_defaults(fn=cmd_ab)
+    p = sub.add_parser("compare"); p.add_argument("a"); p.add_argument("b"); p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_compare)
+    p = sub.add_parser("status"); p.set_defaults(fn=cmd_status)
+    for sp in sub.choices.values():
+        sp.add_argument("--flow", default=argparse.SUPPRESS)
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

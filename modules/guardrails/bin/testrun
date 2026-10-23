@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""testrun: the one way agents run tests, gates, builds and sweeps.
+
+  testrun <repo> <kind> [--max SECONDS] [--wait-max SECONDS] -- <cmd...>
+  testrun --list
+  testrun --stop <repo>-<kind>
+
+<repo> and <kind> are lowercase letters, digits and dashes. The run is named
+<repo>-<kind>; a second run of the same name is refused (exit 75) while one is live.
+
+Linux: the command runs in a transient systemd user scope (systemd-run --user
+--scope --unit=<repo>-<kind>) inside one shared slice with CPU weight and
+memory limits. The scope inherits environment, cwd, stdin and stdout, so
+nothing is written to a unit file (a transient service would copy the
+environment, API keys included, into a readable file). When the run ends,
+hangs past its limit, or testrun dies, everything it started goes with the unit.
+
+macOS: no systemd. The command runs at nice 19 (every core stays available;
+never `taskpolicy -b`, which pins work to the efficiency cores and measured
+21x slower) in its own process group, under a lock per <repo>-<kind>. Before
+starting, testrun waits while macOS reports critical memory pressure on two
+readings a few seconds apart. The whole process group is killed when the run
+ends, times out, or is interrupted.
+
+Time limits (--max, seconds, counted from the start of the command): kind
+`gate*` 1800, `mut*` 7200, anything else 600 on Linux; 3600 (mut* 7200) on
+macOS. --wait-max bounds the macOS memory-pressure wait before the run starts
+(default 3600). Neither counts against the other.
+
+Exit codes: the command's own; 64 usage; 69 no systemd user bus (Linux; the
+command is never run unwrapped); 75 duplicate run or pressure wait ran out;
+124 time limit; 130/143 interrupted.
+
+Config: $TESTRUN_CONFIG, else ~/.config/agent-estate/guardrails.json (written
+by `estate install guardrails`): {"slice": "<unit>.slice"}.
+Test seams: TESTRUN_PLATFORM=mac|linux, TESTRUN_STATE_DIR, TESTRUN_PRESSURE_FILE
+(a file holding the pressure level), TESTRUN_PRESSURE_GAP (seconds between
+readings, default 3), TESTRUN_POLL_SECS (default 1).
+"""
+import errno
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+DEFAULT_SLICE = "agent-tests.slice"
+
+
+def die(code, msg):
+    print(f"testrun: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def platform():
+    forced = os.environ.get("TESTRUN_PLATFORM")
+    if forced in ("mac", "linux"):
+        return forced
+    return "mac" if sys.platform == "darwin" else "linux"
+
+
+def state_dir():
+    explicit = os.environ.get("TESTRUN_STATE_DIR")
+    if explicit:
+        d = Path(explicit)
+    elif platform() == "linux" and os.environ.get("XDG_RUNTIME_DIR"):
+        d = Path(os.environ["XDG_RUNTIME_DIR"]) / "testrun"
+    else:
+        base = os.environ.get("ESTATE_STATE") or str(Path.home() / ".local/state/agent-estate")
+        d = Path(base) / "testrun"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def config_dir():
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "agent-estate"
+
+
+def slice_name():
+    path = os.environ.get("TESTRUN_CONFIG") or str(config_dir() / "guardrails.json")
+    try:
+        name = json.loads(Path(path).read_text()).get("slice")
+        if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.:-]+\.slice", name):
+            return name
+    except (OSError, ValueError, AttributeError):
+        pass
+    return DEFAULT_SLICE
+
+
+def default_limits(kind):
+    mac = platform() == "mac"
+    if kind.startswith("mut"):
+        return 7200, 3600
+    if mac:
+        return 3600, 3600
+    return (1800 if kind.startswith("gate") else 600), 3600
+
+
+# ---- the per-name lock, shared by both platforms and used by --list/--stop ----
+
+def take_lock(unit):
+    """Hold <state>/<unit>.lock exclusively for the life of the process, or exit 75."""
+    path = state_dir() / f"{unit}.lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+            die(75, f"already running: {unit}")
+        raise
+    os.set_inheritable(fd, False)
+    return fd
+
+
+def write_record(fd, record):
+    os.ftruncate(fd, 0)
+    os.pwrite(fd, json.dumps(record).encode(), 0)
+
+
+def live_records():
+    """(name, record) for every lock some live testrun holds."""
+    found = []
+    for path in sorted(state_dir().glob("*.lock")):
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except OSError:
+            continue
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                continue  # nobody holds it: stale file
+            except OSError:
+                pass
+            try:
+                record = json.loads(os.pread(fd, 65536, 0) or b"{}")
+            except ValueError:
+                record = {}
+            found.append((path.stem, record))
+        finally:
+            os.close(fd)
+    return found
+
+
+def cmd_list():
+    rows = live_records()
+    if not rows:
+        print("no test runs")
+    for name, rec in rows:
+        print(f"{name}\tsince {rec.get('started', '?')}\tpid {rec.get('pid', '?')}\t{rec.get('cmd', '')}")
+    return 0
+
+
+def cmd_stop(name):
+    if not NAME_RE.match(name):
+        die(64, f"bad name '{name}' (want <repo>-<kind>, [a-z0-9-] only)")
+    if platform() == "linux":
+        need_bus()
+        r = subprocess.run(["systemctl", "--user", "stop", f"{name}.scope"])
+        if r.returncode != 0:
+            die(1, f"could not stop {name}.scope")
+        print(f"stopped {name}.scope")
+        return 0
+    for live, rec in live_records():
+        if live == name and rec.get("pgid"):
+            try:
+                os.killpg(int(rec["pgid"]), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            print(f"stopped {name}")
+            return 0
+    die(1, f"no such run: {name}")
+
+
+# ---- Linux ----
+
+def need_bus():
+    if subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True).returncode != 0:
+        die(69, "no systemd user bus; refusing to run the command unwrapped "
+                "(is linger on? run `loginctl enable-linger $USER` and re-login)")
+
+
+def run_linux(repo, kind, limit, cmd):
+    unit = f"{repo}-{kind}"
+    need_bus()
+    lock = take_lock(unit)
+    state = subprocess.run(["systemctl", "--user", "is-active", f"{unit}.scope"],
+                           capture_output=True, text=True).stdout.strip()
+    if state in ("active", "activating", "deactivating", "reloading"):
+        die(75, f"already running: {unit}.scope")
+    if state == "failed":
+        subprocess.run(["systemctl", "--user", "reset-failed", f"{unit}.scope"], capture_output=True)
+    write_record(lock, {"pid": os.getpid(), "started": time.strftime("%Y-%m-%dT%H:%M:%S"), "cmd": " ".join(cmd)[:200]})
+    # Test runs are the first thing the kernel should kill when memory runs out.
+    try:
+        with open("/proc/self/oom_score_adj", "w") as f:
+            f.write("1000")
+    except OSError:
+        pass
+    argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}",
+            f"--slice={slice_name()}", f"--description=testrun {unit}: {' '.join(cmd)[:120]}",
+            "-p", f"RuntimeMaxSec={limit}", "-p", "TimeoutStopSec=5", "--", *cmd]
+    start = time.monotonic()
+    interrupted = [0]
+
+    def reset_signals():
+        # Agent harnesses start children with SIGINT/SIGQUIT ignored and the ignore
+        # survives exec; a Python test run would then never see KeyboardInterrupt.
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+
+    child = subprocess.Popen(argv, preexec_fn=reset_signals, pass_fds=())
+
+    def stop_on(code):
+        def handler(_s, _f):
+            interrupted[0] = code
+            subprocess.run(["systemctl", "--user", "stop", f"{unit}.scope"], capture_output=True)
+        return handler
+
+    signal.signal(signal.SIGTERM, stop_on(143))
+    signal.signal(signal.SIGINT, stop_on(130))
+    signal.signal(signal.SIGHUP, stop_on(129))
+    rc = child.wait()  # a signal handler runs, then the wait resumes
+    # Anything the command left running goes with the scope.
+    subprocess.run(["systemctl", "--user", "stop", f"{unit}.scope"], capture_output=True)
+    if interrupted[0]:
+        return interrupted[0]
+    if rc < 0:
+        rc = 128 - rc
+    if rc != 0 and time.monotonic() - start >= limit:
+        print(f"testrun: {unit} hit its time limit ({limit}s) and was stopped", file=sys.stderr)
+        return 124
+    return rc
+
+
+# ---- macOS ----
+
+def pressure_level():
+    forced = os.environ.get("TESTRUN_PRESSURE_FILE")
+    try:
+        if forced:
+            return int(Path(forced).read_text().strip() or 0)
+        out = subprocess.run(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+                             capture_output=True, text=True, timeout=5).stdout
+        return int(out.strip() or 0)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+
+
+def critical_now():
+    """Critical (level 4) on two readings a few seconds apart; warn (2) never counts."""
+    if pressure_level() < 4:
+        return False
+    time.sleep(float(os.environ.get("TESTRUN_PRESSURE_GAP", "3")))
+    return pressure_level() >= 4
+
+
+def signal_group(pgid, sig):
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def run_mac(repo, kind, limit, wait_max, cmd):
+    unit = f"{repo}-{kind}"
+    lock = take_lock(unit)
+    poll = float(os.environ.get("TESTRUN_POLL_SECS", "1"))
+    deadline = time.monotonic() + wait_max
+    announced = False
+    while critical_now():
+        if not announced:
+            print("testrun: waiting for critical memory pressure to clear", file=sys.stderr)
+            announced = True
+        if time.monotonic() >= deadline:
+            die(75, f"memory pressure stayed critical for {wait_max}s; not starting {unit}")
+        time.sleep(poll)
+
+    def lower_priority():
+        os.setpriority(os.PRIO_PROCESS, 0, 19)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+
+    try:
+        job = subprocess.Popen(cmd, start_new_session=True, preexec_fn=lower_priority)
+    except OSError as exc:
+        die(127, f"{cmd[0]}: {exc.strerror}")
+    write_record(lock, {"pid": os.getpid(), "pgid": job.pid, "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "cmd": " ".join(cmd)[:200]})
+    interrupted = [0]
+
+    def on_signal(code):
+        def handler(_s, _f):
+            interrupted[0] = code
+            signal_group(job.pid, signal.SIGTERM)
+        return handler
+
+    signal.signal(signal.SIGTERM, on_signal(143))
+    signal.signal(signal.SIGINT, on_signal(130))
+    signal.signal(signal.SIGHUP, on_signal(129))
+    start = time.monotonic()
+    timed_out = False
+    try:
+        while job.poll() is None:
+            if not timed_out and time.monotonic() - start >= limit:
+                timed_out = True
+                print(f"testrun: {unit} hit its time limit ({limit}s); stopping it", file=sys.stderr)
+                signal_group(job.pid, signal.SIGTERM)
+                kill_at = time.monotonic() + 5
+            if timed_out and time.monotonic() >= kill_at:
+                signal_group(job.pid, signal.SIGKILL)
+            time.sleep(0.1)
+    finally:
+        # The whole group dies with the run, whatever ended it.
+        signal_group(job.pid, signal.SIGTERM)
+        time.sleep(0.05)
+        signal_group(job.pid, signal.SIGKILL)
+        job.wait()
+    if interrupted[0]:
+        return interrupted[0]
+    if timed_out:
+        return 124
+    rc = job.returncode
+    return rc if rc >= 0 else 128 - rc
+
+
+# ---- arguments ----
+
+def int_arg(opts, flag, minimum):
+    if not opts or not opts[0].isdigit() or int(opts[0]) < minimum:
+        die(64, f"{flag} needs an integer >= {minimum}")
+    return int(opts[0])
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0 if argv else 64
+    if argv[0] == "--list":
+        return cmd_list()
+    if argv[0] == "--stop":
+        if len(argv) != 2:
+            die(64, "--stop takes exactly one <repo>-<kind> name")
+        return cmd_stop(argv[1])
+    if len(argv) < 2:
+        die(64, "usage: testrun <repo> <kind> [--max S] [--wait-max S] -- <cmd...>")
+    repo, kind, rest = argv[0], argv[1], argv[2:]
+    for label, value in (("repo", repo), ("kind", kind)):
+        if not NAME_RE.match(value):
+            die(64, f"bad {label} '{value}' ([a-z0-9-] only)")
+    limit, wait_max = default_limits(kind)
+    while rest and rest[0] != "--":
+        flag = rest[0]
+        if flag == "--max":
+            limit = int_arg(rest[1:2], flag, 1)
+        elif flag == "--wait-max":
+            wait_max = int_arg(rest[1:2], flag, 0)
+        else:
+            die(64, f"unexpected argument '{flag}' (options go before --)")
+        rest = rest[2:]
+    cmd = rest[1:]
+    if not rest or not cmd:
+        die(64, "missing command after --")
+    if platform() == "linux":
+        return run_linux(repo, kind, limit, cmd)
+    return run_mac(repo, kind, limit, wait_max, cmd)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

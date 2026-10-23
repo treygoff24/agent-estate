@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Remove the timer/agent and the estate-sync link. Leaves the repo table, the
+# checkouts and the state directory (status and log) alone.
+# shellcheck source=../../lib/estate.sh
+. "$ESTATE_ROOT/lib/estate.sh"
+# shellcheck source=common.sh
+. "$ESTATE_MODULE_DIR/common.sh"
+if [ "$ESTATE_PLATFORM" = mac ]; then
+  run launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  run rm -f -- "$PLIST"
+else
+  run systemctl --user disable --now "$TIMER" 2>/dev/null || true
+  run rm -f -- "$SERVICE" "$TIMER_FILE"
+  run systemctl --user daemon-reload
+fi
+if [ -L "$SYNC_BIN" ] && [ "$(readlink "$SYNC_BIN")" = "$ESTATE_MODULE_DIR/estate-sync" ]; then
+  run rm -f -- "$SYNC_BIN"
+fi
+say "removed the nightly sync (repo table, checkouts and $STATE_DIR/sync kept)"
