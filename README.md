@@ -26,7 +26,9 @@ Each core module in `modules/` has an install script and a doctor check.
 
 The [add-on catalog](addons/README.md) links to standalone public tools with
 install notes. Field guides in `guides/` cover optional machinery: a self-hosted
-Git forge, containers per agent, ZFS snapshots and egress policies. The rules
+Git forge, a container per person or project, ZFS snapshots and egress policies; the
+[Herdr guide](guides/herdr-many-machines.md) is the recommended way to watch and
+steer agents on every machine from one window. The rules
 files in `doctrine/` guide agent behavior; `config-sync` installs them.
 
 ## Principles

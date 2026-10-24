@@ -348,7 +348,8 @@ Any row can also say `does not match estate.toml (run: estate install <module>)`
   - many agents building at once, a full disk, or a laggy Mac — [many-agents-compiling.md](guides/many-agents-compiling.md), [disk-hygiene.md](guides/disk-hygiene.md)
   - several Claude/Codex logins — [many-subscriptions.md](guides/many-subscriptions.md)
   - a self-hosted git server — [self-hosted-git-forgejo.md](guides/self-hosted-git-forgejo.md)
-  - one container per agent, an egress policy, a key broker — [agent-cells-incus.md](guides/agent-cells-incus.md), [egress-control.md](guides/egress-control.md), [credential-broker.md](guides/credential-broker.md)
+  - one container per person or project, an egress policy, a key broker — [agent-cells-incus.md](guides/agent-cells-incus.md), [egress-control.md](guides/egress-control.md), [credential-broker.md](guides/credential-broker.md)
+  - watching and steering agents on every machine from one terminal window — [herdr-many-machines.md](guides/herdr-many-machines.md)
   - an unattended morning check — [morning-maintainer-agent.md](guides/morning-maintainer-agent.md)
   - the rest are listed in the `guides/` folder.
 

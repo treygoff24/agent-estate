@@ -2,6 +2,8 @@
 
 This guide gives you a phone terminal into the agent workspaces on your Mac and your Linux box. The phone app is Moshi, which speaks mosh (a roaming SSH replacement that survives sleep and network changes). Over the tailnet, the phone connects to a [herdr](https://github.com/herdrdev/herdr) session that is already running on each machine, so your agents keep working when the phone goes away. The guide also fixes the most annoying failure: a phone left attached shrinks every terminal tab on your desk to phone width.
 
+To see every machine's agents in one window at your desk, see [herdr-many-machines.md](herdr-many-machines.md).
+
 Herdr is a third-party terminal-workspace tool. Moshi is a third-party iOS app (getmoshi.app). This guide only describes how to wire them together.
 
 ## Do you need this?
